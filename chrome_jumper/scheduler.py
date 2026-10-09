@@ -45,34 +45,54 @@ class Scheduler:
         self._locks: dict[str, asyncio.Lock] = {}
         self._sem: asyncio.Semaphore | None = None
         self._sem_size = 0
+        self._ctl = asyncio.Lock()  # 전체 시작/중지 직렬화(중지 진행 중 시작이 섞이지 않게)
 
     # ------------------------------------------------------------ 스레드 안전 공개 API
-    def _call(self, coro, wait: float | None = 10):
+    # GUI(메인 스레드)는 스케줄러를 절대 동기로 기다리지 않는다(wait=None 기본).
+    # 스케줄러 스레드가 Tk 객체 정리(예: GC가 부른 tkinter.Variable.__del__)로 메인 스레드를
+    # 기다리는 순간 메인 스레드가 스케줄러를 기다리고 있으면 서로 기다리며 멈추기 때문이다.
+    # 결과·오류는 on_event로 전달된다. wait 값은 테스트·스크립트용이다.
+    def _call(self, coro, wait: float | None = None):
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        fut.add_done_callback(self._report_failure)
         return fut.result(wait) if wait else fut
 
-    def update_settings(self, settings: Settings) -> None:
-        self._call(self._update(copy.deepcopy(settings)))
+    def _report_failure(self, fut) -> None:
+        if fut.cancelled() or fut.exception() is None:
+            return
+        exc = fut.exception()
+        logger.error("스케줄러 명령 실패: %r", exc)
+        self.on_event("log", {"time": datetime.now(), "account": "전체", "level": "ERROR",
+                              "msg": f"스케줄러 명령 실패: {exc!r}"})
 
-    def start_all(self) -> None:
-        self._call(self._start_all())
+    def update_settings(self, settings: Settings, wait: float | None = None):
+        return self._call(self._update(copy.deepcopy(settings)), wait)
+
+    def start_all(self, wait: float | None = None):
+        return self._call(self._start_all(), wait)
 
     def stop_all(self, wait: float | None = 30):
         """wait=None이면 기다리지 않고 Future를 돌려준다(GUI용)."""
         return self._call(self._stop_all(), wait)
 
-    def run_now(self, acc_id: str) -> None:
-        self._call(self._run_now(acc_id))
+    def run_now(self, acc_id: str, wait: float | None = None):
+        return self._call(self._run_now(acc_id), wait)
+
+    def close(self) -> None:
+        """이벤트 루프 종료. 중지가 끝난 뒤 부른다."""
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(5)
 
     def shutdown(self) -> None:
+        """중지 후 종료(테스트·스크립트용, 기다림). GUI는 stop_all(wait=None) 후 close()를 쓴다."""
         try:
             self.stop_all()
         finally:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join(5)
+            self.close()
 
     def snapshot(self) -> dict[str, AccountState]:
-        return self._call(self._snapshot())
+        return self._call(self._snapshot(), 10)
 
     # ------------------------------------------------------------ 내부(루프 스레드)
     def _log(self, acc_name: str, level: str, msg: str) -> None:
@@ -117,6 +137,10 @@ class Scheduler:
                     self._loops[acc.id] = asyncio.create_task(self._account_loop(acc.id))
 
     async def _start_all(self) -> None:
+        async with self._ctl:
+            await self._start_all_locked()
+
+    async def _start_all_locked(self) -> None:
         if self.running:
             return
         self.running = True
@@ -127,6 +151,10 @@ class Scheduler:
         self.on_event("running", {"running": True})
 
     async def _stop_all(self) -> None:
+        async with self._ctl:
+            await self._stop_all_locked()
+
+    async def _stop_all_locked(self) -> None:
         if self.running:
             self._log("전체", "INFO", "전체 중지 요청: 새 예약을 멈추고 진행 중 작업을 정리합니다.")
         self.running = False

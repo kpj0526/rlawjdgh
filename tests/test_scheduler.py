@@ -222,3 +222,57 @@ def test_real_stop_closes_chrome(fresh):
     sch.shutdown()
     assert st.last_result.status == "중지됨"
     assert "Chrome 닫음" in rec.logs("느림")
+
+
+# ---------------------------------------------------------------- QA 결함: GUI 전체 시작 10초 멈춤(스레드 교착)
+
+def test_gui_calls_never_block_when_scheduler_thread_is_busy():
+    """스케줄러 스레드가 잠시 막혀도(예: Tk 객체 정리로 메인 스레드를 기다림) GUI용 호출은 즉시 돌아와야 한다.
+
+    결함 당시 start_all()이 결과를 10초 동기로 기다려, 스케줄러 스레드가 메인 스레드를 기다리는 순간 교착됐다.
+    """
+    async def fake(opts, uid, pw, log):
+        return CycleResult("성공", "ok")
+
+    sch = Scheduler(run_fn=fake)
+    s = make_settings("http://x/", ("A", "a", "p", dict(start_mode="now", interval_min=1)))
+    try:
+        sch._loop.call_soon_threadsafe(time.sleep, 1.5)  # 스케줄러 스레드를 1.5초 붙잡음
+        time.sleep(0.05)
+        t0 = time.time()
+        sch.update_settings(s)
+        sch.start_all()
+        sch.run_now(s.accounts[0].id)
+        fut = sch.stop_all(wait=None)
+        assert time.time() - t0 < 0.2  # 하나도 기다리지 않음
+        fut.result(10)  # 스레드가 풀리면 정상 처리됨
+    finally:
+        sch.shutdown()
+
+
+def test_start_during_stop_is_serialized_and_runs():
+    """전체 중지가 진행 중일 때 전체 시작을 누르면 중지가 끝난 뒤 시작되고, 새 예약이 지워지지 않는다."""
+    calls = []
+
+    async def slow_close(opts, uid, pw, log):
+        calls.append(uid)
+        try:
+            await asyncio.sleep(60)
+        finally:
+            await asyncio.sleep(0.5)  # Chrome 닫기 같은 정리 시간
+        return CycleResult("성공", "ok")
+
+    sch = Scheduler(run_fn=slow_close)
+    s = make_settings("http://x/", ("A", "a", "p", dict(start_mode="now", interval_min=5)))
+    sch.update_settings(s)
+    sch.start_all()
+    acc_id = s.accounts[0].id
+    try:
+        assert wait_until(lambda: sch.snapshot()[acc_id].status == "실행 중", 3)
+        stop = sch.stop_all(wait=None)
+        sch.start_all()  # 중지 정리 중에 시작
+        stop.result(10)
+        assert wait_until(lambda: len(calls) >= 2, 5)  # 중지 후 다시 시작되어 새 주기 실행
+        assert sch.running and acc_id in sch._loops
+    finally:
+        sch.shutdown()

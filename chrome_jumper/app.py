@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import queue
@@ -361,8 +362,15 @@ class App:
     def _advanced(self):
         d = AdvancedDialog(self.root, self.settings)
         self.root.wait_window(d)
+        self._collect()
         if d.ok:
             self._save()
+
+    @staticmethod
+    def _collect() -> None:
+        # 닫힌 대화상자의 Tk 변수(StringVar 등)는 순환 참조로 남아 있다가 아무 스레드의 GC에서
+        # __del__이 불릴 수 있다. Tk 호출은 메인 스레드에서 끝내도록 여기서 바로 정리한다.
+        gc.collect()
 
     def _selected(self) -> Account | None:
         sel = self.tv.selection()
@@ -371,6 +379,7 @@ class App:
     def _add(self):
         d = AccountDialog(self.root, None)
         self.root.wait_window(d)
+        self._collect()
         if d.result:
             acc, pw = d.result
             acc.set_password(pw or "")
@@ -385,6 +394,7 @@ class App:
             return
         d = AccountDialog(self.root, acc)
         self.root.wait_window(d)
+        self._collect()
         if d.result:
             new, pw = d.result
             if pw:
@@ -519,10 +529,21 @@ class App:
         if self.scheduler.running or any(s.status in ("실행 중", "실행 대기") for s in self.states.values()):
             if not messagebox.askyesno("종료", "실행 중인 작업을 중지하고 종료할까요?"):
                 return
-        self.l_run.configure(text="● 종료하는 중…", fg="#f5b942")
-        self.root.update_idletasks()
-        self.scheduler.shutdown()
-        self.root.destroy()
+        self.l_run.configure(text="● 종료하는 중… (Chrome 정리)", fg="#f5b942")
+        self.b_start.configure(state="disabled")
+        self.b_stop.configure(state="disabled")
+        fut = self.scheduler.stop_all(wait=None)
+        deadline = datetime.now().timestamp() + 30
+
+        def finish():
+            # 메인 스레드를 막지 않고 중지 완료를 기다린다(그동안 Tk 이벤트도 계속 처리).
+            if not fut.done() and datetime.now().timestamp() < deadline:
+                self.root.after(100, finish)
+                return
+            self.scheduler.close()
+            self.root.destroy()
+
+        finish()
 
 
 def main():

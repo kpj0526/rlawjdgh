@@ -194,6 +194,7 @@ def test_real_concurrent_accounts_isolated(fresh):
     assert snap[ids[0]].last_result.status == "성공"
     assert snap[ids[1]].last_result.status == "성공"
     assert snap[ids[2]].last_result.status == "실패"
+    assert "로그인 실패" in snap[ids[2]].last_result.message  # 페이지 전환 중 오판 없이 실패 원인 기록
     # 쿠키·세션 분리: 각 계정의 점프는 자기 사용자로만 기록되고 세션 ID도 다르다
     log = fresh["state"].log
     assert sorted(e["user"] for e in log) == ["test1"] * 4 + ["test2"] * 4

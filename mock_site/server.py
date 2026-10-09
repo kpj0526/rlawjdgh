@@ -143,6 +143,22 @@ def make_handler(state: State):
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_slowly(self, body: str, pause: float = 0.6):
+            """로그인 실패 페이지를 나눠 보낸다: 새 문서가 열렸지만 아직 비밀번호 칸이 없는 순간을 재현
+            (실제 사이트에서 응답이 느릴 때와 같은 상태)."""
+            data = body.encode("utf-8")
+            cut = data.index(b"<body>") + len(b"<body>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data[:cut] + b" " * 2048)  # 브라우저가 바로 그리도록 충분히 보냄
+            self.wfile.flush()
+            time.sleep(pause)
+            self.wfile.write(data[cut:])
+            self.close_connection = True
+
         def _redirect(self, to, headers=None):
             self._send(302, "", headers={"Location": to, **(headers or {})})
 
@@ -199,8 +215,9 @@ def make_handler(state: State):
                 if USERS.get(uid) != pw:
                     with state.lock:
                         state.logins.append({"user": uid, "ok": False, "time": datetime.now().isoformat()})
-                    return self._send(200, LOGIN_PAGE.format(
-                        next=html.escape(nxt), script="<script>alert('아이디 또는 비밀번호가 일치하지 않습니다.')</script>"))
+                    page = LOGIN_PAGE.format(
+                        next=html.escape(nxt), script="<script>alert('아이디 또는 비밀번호가 일치하지 않습니다.')</script>")
+                    return self._send_slowly(page)
                 sid = secrets.token_hex(12)
                 with state.lock:
                     state.sessions[sid] = uid

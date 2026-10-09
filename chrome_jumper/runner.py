@@ -284,11 +284,22 @@ class _Session:
             except PWError:
                 still = 1  # 페이지 전환 중
             if not still:
+                # 폼 제출로 페이지가 바뀌는 중에는 비밀번호 칸이 잠깐 사라진다. 새 페이지가 뜬 뒤에도
+                # 없고 실패 알림도 없을 때만 성공으로 본다(로그인 실패 페이지가 다시 그려지는 경우 대비).
+                # wait_for_load_state는 문서가 아직 받는 중이어도 바로 돌아올 수 있어 readyState를 직접 본다.
                 try:
-                    await self.page.wait_for_load_state("domcontentloaded")
+                    await self.page.wait_for_function("document.readyState !== 'loading'", polling=100)
                 except PWError:
                     pass
-                return
+                await asyncio.sleep(0.5)
+                msgs.extend(m for _t, m in self._drain())
+                try:
+                    still = await self.page.locator("input[type=password]:visible").count()
+                except PWError:
+                    still = 1
+                if not still:
+                    return
+                continue
             if msgs:
                 await asyncio.sleep(0.5)
                 if await self.page.locator("input[type=password]:visible").count():

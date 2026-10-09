@@ -1,4 +1,4 @@
-# Chrome 점프 자동화 (작업 요청 001)
+# Chrome 점프 자동화 (작업 요청 001·002)
 
 여러 계정을 등록해 두면 계정마다 **별도의 Chrome**을 열어
 `설정 URL 이동 → 로그인 → 점프 4종(라인업/PR · 실시간 출근부 · 매니저 출근부 · 홍보관) 클릭 → 각 확인 창 '확인' → 결과 기록 → Chrome 닫기`
@@ -8,7 +8,55 @@
 - 대상 사이트 주소는 화면에서 입력합니다(특정 도메인이 코드에 고정돼 있지 않음).
 - 실제 계정 없이 검증할 수 있도록 **로컬 모의 사이트**(`mock_site`)를 함께 제공합니다.
 
-## 1. 준비물
+## 0. 내려받아 바로 실행 (배포 ZIP, Python 필요 없음)
+
+| 항목 | 조건 |
+| --- | --- |
+| OS | Windows 10/11 64비트 |
+| Chrome | Google Chrome 설치 필요. 평소 쓰는 Chrome을 그대로 씁니다(브라우저를 따로 받지 않음). 확인 버전: 154 |
+| 그 밖 | Python, `.venv`, 인터넷 설치 과정 모두 필요 없음 |
+
+1. `ChromeJumper-<버전>-win64.zip`(약 51MB)을 받아 마우스 오른쪽 버튼 → **압축 풀기**로 원하는 폴더에 풉니다. 풀면 약 136MB입니다.
+   - ZIP 안에서 바로 실행하지 마세요. 짧은 경로(예: 바탕화면, `C:\Tools`)를 권장합니다.
+2. 풀린 `ChromeJumper` 폴더의 **`ChromeJumper.exe`**를 더블클릭합니다.
+   - 서명되지 않은 프로그램이라 "Windows의 PC 보호" 창이 뜰 수 있습니다. **추가 정보 → 실행**을 누릅니다.
+   - `_internal` 폴더는 실행에 필요하므로 지우거나 옮기지 마세요.
+3. 사용법은 3장과 같습니다. 설정·로그는 프로그램 폴더가 아니라 `%APPDATA%\ChromeJumper`에 저장되므로, 새 버전 ZIP을 풀어 실행하면 기존 설정을 그대로 씁니다.
+4. 받은 파일이 맞는지는 함께 전달된 SHA-256 값과 비교합니다(PowerShell: `Get-FileHash .\ChromeJumper-0.2.0-win64.zip`).
+
+ZIP에는 프로그램 파일과 `README.txt`(요약 사용법)만 들어 있습니다. 설정, 비밀번호, 로그, 가상환경, 빌드 캐시, 테스트, 모의 사이트는 넣지 않으며, 빌드 스크립트가 이를 검사해 들어가면 빌드를 실패시킵니다.
+
+### 배포 파일 만들기 (개발자용)
+
+```bat
+build.bat
+```
+
+| 단계 | 내용 |
+| --- | --- |
+| 1 | `.venv`가 없으면 `setup.bat` 실행, `requirements-build.txt`(PyInstaller 6.22.3 고정) 설치 |
+| 2 | `packaging\ChromeJumper.spec`으로 창 모드 실행 파일 빌드(onedir). Playwright 자체 훅이 드라이버(`node.exe` + `package`)를 포함하고, 브라우저는 넣지 않음 |
+| 3 | `packaging\MockSite.spec`으로 QA용 모의 사이트 실행 파일 빌드(콘솔) |
+| 4 | `packaging\make_zip.py`가 ZIP 생성, 금지 항목 검사, `dist\SHA256SUMS.txt`·`dist\BUILD_INFO.json`(크기·해시·원본 커밋) 기록 |
+
+산출물(`dist\`, Git에는 넣지 않음):
+
+| 파일 | 대상 |
+| --- | --- |
+| `ChromeJumper-<버전>-win64.zip` | 사용자 배포본 |
+| `ChromeJumper-MockSite-<버전>-win64.zip` | QA·점검용 모의 사이트. 사용자에게는 필요 없음 |
+| `SHA256SUMS.txt`, `BUILD_INFO.json` | 해시, 크기, 빌드 원본 커밋 |
+
+### 배포 파일 점검 (QA·개발자용)
+
+`ChromeJumper.exe --selftest`는 창 없이 지정 계정들을 '즉시 시작'으로 전체 시작해 1주기씩 실행합니다. 결과를 JSON으로 저장하고, 모두 성공이면 종료 코드 0, 하나라도 실패면 1, 인자 오류면 2를 돌려줍니다. 사용자 설정 폴더는 건드리지 않고, 결과에 비밀번호를 쓰지 않습니다.
+
+```bat
+MockSite.exe --port 8765
+ChromeJumper.exe --selftest --url http://127.0.0.1:8765/owner --account A:test1:pass1 --account B:test2:pass2 --out result.json
+```
+
+## 1. 준비물 (소스에서 실행할 때)
 
 | 항목 | 내용 |
 | --- | --- |
@@ -16,7 +64,7 @@
 | Python | 3.10 이상 (python.org 설치 시 "Add python.exe to PATH" 체크). 확인 버전: 3.12.10 |
 | Chrome | PC에 설치된 Google Chrome을 그대로 사용합니다. 확인 버전: 154 |
 
-## 2. 설치·실행
+## 2. 설치·실행 (소스에서 실행할 때)
 
 탐색기에서 이 폴더를 열고 다음 파일을 더블클릭합니다.
 
@@ -227,6 +275,7 @@ set CJ_TEST_HEADED=1 && run_tests.bat   :: Chrome 창을 띄워서 보기
 | 파일 | 검증 내용 |
 | --- | --- |
 | `tests/test_schedule.py` | 예약 계산: 즉시·지정 시각, 종료 시각, 자정 넘김, 겹침 건너뜀, 입력 검증 |
+| `tests/test_selftest.py` | 배포 점검용 `--selftest`: 1주기 실행·결과 JSON·비밀번호 미기록·Chrome 종료, 인자 오류 |
 | `tests/test_validation.py` | 반복 주기 검증(inf·nan·1e20·범위 밖·숫자 아님): 계산·모델·화면 입력 창·설정 파일 로드, 실행 중 잘못된 값이면 '설정 오류' 표시와 다른 계정 유지 |
 | `tests/test_runner.py` | 실제 Chrome + 모의 사이트: 성공, 쿨다운 건너뜀, 쿨다운 후 재실행, 로그인 실패, 버튼 없음, 확인 창 없음, 횟수 초과, HTML 모달, CAPTCHA, 응답 지연 시간 초과, 접속 불가, Chrome 실행 실패, 로그인 화면 URL, 확인 승인 뒤 HTTP 500 → 실패, 성공 신호 없음 → 확인 불가, 화면 변화·새로고침으로 성공 확인. 비밀번호가 로그에 없는지와 Chrome 닫음도 확인 |
 | `tests/test_scheduler.py` | 주기 반복, 중지 후 새 주기 없음, 설정 변경 시 다음 실행 재계산, 비활성 계정 제외, 실패 격리, 같은 계정 중복 실행 방지, 중지 시 진행 작업 취소와 정리, 주기 시간 제한, 실제 Chrome 3계정 동시 실행·세션 분리, 실제 실행 중 중지 시 Chrome 닫음 |
@@ -247,7 +296,9 @@ set CJ_TEST_HEADED=1 && run_tests.bat   :: Chrome 창을 띄워서 보기
 
 ```
 chrome_jumper/   app.py(GUI) scheduler.py(예약·동시 실행·중지) runner.py(Chrome 한 주기)
-                 schedule.py(예정 시각 계산) config.py(설정·비밀번호 암호화)
+                 schedule.py(예정 시각 계산) config.py(설정·비밀번호 암호화) selftest.py(배포 점검)
+packaging/       ChromeJumper.spec MockSite.spec launcher.py mock_launcher.py make_zip.py
+build.bat requirements-build.txt
 mock_site/       server.py(로컬 모의 사이트)
 tests/           pytest 테스트
 setup.bat run.bat run_mock.bat run_tests.bat

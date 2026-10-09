@@ -292,26 +292,13 @@ class App:
         for text, cmd in (("지금 실행", self._run_now), ("삭제", self._delete), ("수정", self._edit),
                           ("계정 추가", self._add)):
             ttk.Button(bar, text=text, command=cmd).pack(side="right", padx=3)
-        det = ttk.LabelFrame(upper, text="선택 계정 - 최근 실행의 버튼별 결과", padding=6)
-        det.pack(side="bottom", fill="x", pady=(8, 0))
-        self.l_det = ttk.Label(det, text="계정을 선택하세요.", style="Muted.TLabel")
-        self.l_det.pack(fill="x")
-        self.tv_det = ttk.Treeview(det, columns=("btn", "out", "detail"), show="headings", height=4)
-        for c, h, w in (("btn", "버튼", 150), ("out", "결과", 100), ("detail", "상세/오류 원인", 700)):
-            self.tv_det.heading(c, text=h)
-            self.tv_det.column(c, width=w, anchor="w")
-        for k, v in {"성공": "#3ecf8e", "대기/비활성": "#c9a227", "버튼 없음": "#ff6b6b",
-                     "확인 창 없음": "#ff6b6b", "실패": "#ff6b6b", "확인 불가": "#f5b942"}.items():
-            self.tv_det.tag_configure(k, foreground=v)
-        self.tv_det.pack(fill="x")
-        tv = ttk.Treeview(upper, columns=self.COLS, show="headings", selectmode="browse", height=6)
+        tv = ttk.Treeview(upper, columns=self.COLS, show="headings", selectmode="browse", height=8)
         for c, h, w in zip(self.COLS, self.HEAD, self.WIDTH):
             tv.heading(c, text=h)
             tv.column(c, width=w, anchor="center" if c not in ("name", "login") else "w")
         for k, v in {**STATUS_COLORS, **RESULT_COLORS}.items():
             tv.tag_configure(k, foreground=v)
         tv.pack(fill="both", expand=True)
-        tv.bind("<<TreeviewSelect>>", lambda e: self._show_detail())
         tv.bind("<Double-1>", lambda e: self._edit())
         self.tv = tv
 
@@ -476,24 +463,6 @@ class App:
                 self.tv.move(acc.id, "", i)
             else:
                 self.tv.insert("", i, iid=acc.id, values=values, tags=tags)
-        self._show_detail()
-
-    def _show_detail(self):
-        acc = self._selected()
-        for iid in self.tv_det.get_children():
-            self.tv_det.delete(iid)
-        if not acc:
-            self.l_det.configure(text="계정을 선택하세요.")
-            return
-        st = self.states.get(acc.id)
-        res = st.last_result if st else None
-        if not res:
-            self.l_det.configure(text=f"[{acc.name}] 아직 실행 기록이 없습니다.")
-            return
-        took = f"{(res.finished - res.started).total_seconds():.0f}초" if res.finished else "-"
-        self.l_det.configure(text=f"[{acc.name}] {fmt_dt(res.started)} 시작 · {took} · {res.status} - {res.message}")
-        for j in res.jumps:
-            self.tv_det.insert("", "end", values=(j.label, j.outcome, j.detail), tags=(j.outcome,))
 
     def _log_line(self, t: datetime, who: str, level: str, msg: str):
         self.t_log.configure(state="normal")

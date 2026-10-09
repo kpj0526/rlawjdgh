@@ -71,6 +71,9 @@ def test_site_variants(opts, fresh, user, expected, status):
     assert outcomes(res) == expected, res.jumps
     assert res.status == status
     assert_closed(logs)
+    # 버튼별 결과·원인이 로그에 한 줄씩 남는다(요청 003: 화면 패널 대신 로그로 확인)
+    for j in res.jumps:
+        assert f"{j.label}: {j.outcome} - {j.detail}" in [m for _, m in logs]
 
 
 def test_captcha_is_reported_not_bypassed(opts, fresh):

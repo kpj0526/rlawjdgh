@@ -11,7 +11,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .schedule import parse_hhmm
+import math
+
+from .schedule import INTERVAL_USER_MIN, check_interval, parse_hhmm
+
+# 시간 제한 허용 범위(초): 단계, 확인 창, 한 주기, 결과 확인 순서
+TIMEOUT_RANGES = ((1, 600), (1, 120), (10, 3600), (1, 120))
 
 DEFAULT_JUMPS = ["라인업/PR 점프", "실시간 출근부 점프", "매니저 출근부 점프", "홍보관 점프"]
 
@@ -94,18 +99,42 @@ class Account:
     def password(self) -> str:
         return unprotect(self.password_enc)
 
+    def sanitize(self) -> list[str]:
+        """설정 파일의 잘못된 값을 기본값으로 바꾼다(저장 가능한 상태로). 바꾼 항목 이름을 돌려준다."""
+        fixed = []
+        default = Account(name="", login_id="")
+        for attr, check in (("interval_min", lambda v: check_interval(v, INTERVAL_USER_MIN)),
+                            ("start_time", parse_hhmm),
+                            ("end_time", lambda v: v == "" or parse_hhmm(v))):
+            try:
+                check(getattr(self, attr))
+            except ValueError:
+                setattr(self, attr, getattr(default, attr))
+                fixed.append({"interval_min": "반복 주기", "start_time": "시작 시각", "end_time": "종료 시각"}[attr])
+        if self.start_mode not in ("now", "at"):
+            self.start_mode = default.start_mode
+            fixed.append("시작 방식")
+        for attr in ("name", "login_id", "password_enc"):
+            if not isinstance(getattr(self, attr), str):
+                setattr(self, attr, str(getattr(self, attr)))
+        if not isinstance(self.enabled, bool):
+            self.enabled = False
+        return fixed
+
     def validate(self) -> None:
-        if not self.name.strip():
+        """화면 입력·설정 파일 로드 공통 검사. 실행 가능한 값만 통과한다."""
+        if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("식별 이름을 입력하세요.")
-        if not self.login_id.strip():
+        if not isinstance(self.login_id, str) or not self.login_id.strip():
             raise ValueError("로그인 ID를 입력하세요.")
+        if not isinstance(self.enabled, bool):
+            raise ValueError("활성 여부 값이 잘못되었습니다.")
         if self.start_mode not in ("now", "at"):
             raise ValueError("시작 방식이 잘못되었습니다.")
         parse_hhmm(self.start_time)
         if self.end_time:
             parse_hhmm(self.end_time)
-        if not (self.interval_min > 0):
-            raise ValueError("반복 주기(분)는 0보다 커야 합니다.")
+        self.interval_min = check_interval(self.interval_min, INTERVAL_USER_MIN)
 
 
 @dataclass
@@ -118,22 +147,70 @@ class Settings:
     max_concurrent: int = 4
     step_timeout_sec: float = 20  # 페이지 이동·요소 대기 제한
     dialog_timeout_sec: float = 5  # 버튼 클릭 뒤 확인 창 대기 제한
+    verify_timeout_sec: float = 8  # 확인 승인 뒤 사이트 성공 신호 대기 제한
     cycle_timeout_sec: float = 180  # 한 주기 전체 제한
 
     # -------- 저장
+    # 설정 파일을 읽을 때 발견한 문제(화면에 알림). 저장하지 않는다.
+    load_errors: list[str] = field(default_factory=list, repr=False, compare=False)
+
     @classmethod
     def load(cls, path: Path) -> "Settings":
+        """설정 파일 읽기. 잘못된 계정 값은 그 계정을 비활성으로 돌리고 load_errors에 적는다."""
         if not path.exists():
             return cls()
         raw = json.loads(path.read_text(encoding="utf-8"))
-        accounts = [Account(**a) for a in raw.pop("accounts", [])]
-        known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
-        return cls(accounts=accounts, **known)
+        errors: list[str] = []
+        accounts = []
+        for i, a in enumerate(raw.pop("accounts", []) or []):
+            try:
+                acc = Account(**{k: v for k, v in a.items() if k in Account.__dataclass_fields__})
+            except TypeError as exc:
+                errors.append(f"{i + 1}번째 계정을 읽지 못해 제외했습니다: {exc}")
+                continue
+            try:
+                acc.validate()
+            except ValueError as exc:
+                fixed = acc.sanitize()
+                acc.enabled = False
+                note = f" ({', '.join(fixed)} 기본값으로 바꿈)" if fixed else ""
+                errors.append(f"계정 '{acc.name}': {exc}{note} → 비활성으로 바꿨습니다. 확인·수정 후 다시 활성화하세요.")
+            accounts.append(acc)
+        known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__ and k != "load_errors"}
+        s = cls(accounts=accounts, **known)
+        s.load_errors = errors + s._fix_options()
+        return s
+
+    def _fix_options(self) -> list[str]:
+        """전역 옵션이 실행 불가능한 값이면 기본값으로 되돌린다."""
+        errors = []
+        default = Settings()
+        names = ("step_timeout_sec", "dialog_timeout_sec", "cycle_timeout_sec", "verify_timeout_sec")
+        for name, (lo, hi) in zip(names, TIMEOUT_RANGES):
+            v = getattr(self, name)
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and lo <= v <= hi
+            if not ok:
+                errors.append(f"옵션 {name}={v!r} 이(가) 잘못되어 기본값 {getattr(default, name)}(으)로 바꿨습니다.")
+                setattr(self, name, getattr(default, name))
+        mc = self.max_concurrent
+        if isinstance(mc, bool) or not isinstance(mc, int) or not 1 <= mc <= 20:
+            errors.append(f"옵션 max_concurrent={mc!r} 이(가) 잘못되어 기본값 4로 바꿨습니다.")
+            self.max_concurrent = 4
+        if not isinstance(self.target_url, str):
+            errors.append("대상 URL 값이 잘못되어 비웠습니다.")
+            self.target_url = ""
+        if not isinstance(self.jump_labels, list) or not all(isinstance(x, str) and x.strip() for x in self.jump_labels) \
+                or not self.jump_labels:
+            errors.append("점프 버튼 이름 목록이 잘못되어 기본값으로 바꿨습니다.")
+            self.jump_labels = list(DEFAULT_JUMPS)
+        return errors
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8")
+        data = asdict(self)
+        data.pop("load_errors", None)
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
         os.replace(tmp, path)
 
     def account(self, acc_id: str) -> Account | None:

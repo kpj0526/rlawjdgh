@@ -4,7 +4,8 @@ import asyncio
 
 import pytest
 
-from chrome_jumper.runner import COOLDOWN, FAILED, NO_BUTTON, NO_DIALOG, OK, RunOptions, run_cycle
+from chrome_jumper.runner import (COOLDOWN, FAILED, NO_BUTTON, NO_DIALOG, OK, UNVERIFIED, JumpResult, RunOptions,
+                                  _overall, run_cycle)
 
 
 def run(opts, uid, pw):
@@ -27,6 +28,8 @@ def test_success_clicks_four_and_confirms(opts, fresh):
     assert res.status == "성공", res.message
     assert outcomes(res) == [OK] * 4
     assert all("점프할까요?" in j.detail for j in res.jumps)  # 확인 창 메시지를 승인함
+    # 승인만이 아니라 사이트의 실제 성공 신호로 판정
+    assert all(any(sig in j.detail for sig in ("쿨다운 전환", "횟수 표시 변화", "성공 응답")) for j in res.jumps)
     assert fresh["state"].count("test1", "lineup") == 1
     assert sorted(e["type"] for e in fresh["state"].log) == ["lineup", "manager", "promo", "realtime"]
     assert_closed(logs)
@@ -102,3 +105,46 @@ def test_chrome_launch_failure(opts):
     o = RunOptions(**{**opts.__dict__, "chrome_path": r"C:\nope\chrome.exe"})
     res, _ = run(o, "test1", "pass1")
     assert res.status == "실패" and "Chrome 실행 실패" in res.message
+
+
+# ---------------------------------------------------------------- QA 결함: 확인 승인만으로 성공 처리하던 문제
+
+def test_server_rejects_jump_with_500_is_failure_not_success(opts, fresh):
+    """확인 창은 승인했지만 서버가 HTTP 500으로 거부하고 횟수도 그대로 → 성공으로 기록하면 안 된다."""
+    res, logs = run(opts, "failjump", "failjump1")
+    assert outcomes(res) == [FAILED] * 4, res.jumps
+    assert all("HTTP 500" in j.detail and "점프할까요?" in j.detail for j in res.jumps)
+    assert res.status == "실패"
+    assert fresh["state"].log == []  # 서버 기준 실제 점프 0회
+    assert_closed(logs)
+
+
+def test_no_success_signal_is_unverified_not_success(opts, fresh):
+    """서버가 200(빈 응답)만 주고 화면·횟수 변화가 없으면 '확인 불가'. 성공으로 세지 않는다."""
+    res, logs = run(opts, "nosignal", "nosignal1")
+    assert outcomes(res) == [UNVERIFIED] * 4, res.jumps
+    assert res.status == "실패"
+    assert fresh["state"].log == []
+    assert_closed(logs)
+
+
+def test_success_detected_from_page_change_without_success_flag(opts, fresh):
+    """성공 플래그가 없는 사이트: 버튼 대기 전환·횟수 변화로 성공을 확인한다."""
+    res, _ = run(opts, "quiet", "quiet1")
+    assert outcomes(res) == [OK] * 4, res.jumps
+    assert all(("쿨다운 전환" in j.detail) or ("횟수 표시 변화" in j.detail) for j in res.jumps)
+    assert len(fresh["state"].log) == 4
+
+
+def test_success_detected_after_page_reload(opts, fresh):
+    """점프 뒤 페이지를 새로고침하는 사이트: 새 화면에서 해당 카드가 대기 상태인지로 확인한다."""
+    res, _ = run(opts, "reload", "reload1")
+    assert outcomes(res) == [OK] * 4, res.jumps
+    assert len(fresh["state"].log) == 4
+
+
+def test_overall_never_counts_unverified_as_success():
+    j = lambda o: JumpResult("x", o)  # noqa: E731
+    assert _overall([j(UNVERIFIED)] * 4) == "실패"
+    assert _overall([j(OK)] * 3 + [j(UNVERIFIED)]) == "부분 성공"
+    assert _overall([j(OK)] * 4) == "성공"

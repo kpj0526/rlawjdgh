@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
@@ -23,6 +24,7 @@ COOLDOWN = "대기/비활성"
 NO_BUTTON = "버튼 없음"
 NO_DIALOG = "확인 창 없음"
 FAILED = "실패"
+UNVERIFIED = "확인 불가"  # 확인 창은 승인했지만 사이트의 성공 신호를 확인하지 못함
 
 SUCCESS_WORDS = ("완료", "되었습니다", "성공", "올렸습니다")
 FAIL_WORDS = ("실패", "불가", "초과", "오류", "없습니다", "남은 시간", "후에 다시", "로그인")
@@ -62,10 +64,13 @@ class RunOptions:
     chrome_path: str = ""
     step_timeout_sec: float = 20
     dialog_timeout_sec: float = 5
+    verify_timeout_sec: float = 8
 
 
 _FIND_JS = r"""
-(label) => {
+(arg) => {
+  // arg: { label, reuse } - reuse=true면 직전에 표시한 버튼이 아직 있으면 그 버튼 상태를 본다.
+  const { label, reuse } = arg;
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const visible = el => {
     const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
@@ -73,10 +78,14 @@ _FIND_JS = r"""
   };
   const CLICK = 'button, a, input[type=button], input[type=submit], [role=button]';
   const textOf = el => norm(el.tagName === 'INPUT' ? el.value : el.innerText);
-  document.querySelectorAll('[data-cj-target]').forEach(e => e.removeAttribute('data-cj-target'));
-  const all = [...document.querySelectorAll(CLICK)].filter(visible);
-  let hit = all.find(el => textOf(el) === label) || all.find(el => textOf(el).includes(label));
-  let via = 'text';
+  let hit = null, via = 'text';
+  const prev = reuse ? document.querySelector('[data-cj-target]') : null;
+  if (prev && prev.isConnected && visible(prev)) { hit = prev; via = 'same'; }
+  if (!hit) {
+    document.querySelectorAll('[data-cj-target]').forEach(e => e.removeAttribute('data-cj-target'));
+    const all = [...document.querySelectorAll(CLICK)].filter(visible);
+    hit = all.find(el => textOf(el) === label) || all.find(el => textOf(el).includes(label));
+  }
   if (!hit) {
     // 쿨다운으로 버튼 글자가 바뀐 경우: 카드 제목에서 위로 올라가 버튼이 하나뿐인 영역을 찾는다.
     const titles = [...document.querySelectorAll('body *')].filter(el =>
@@ -94,8 +103,16 @@ _FIND_JS = r"""
   }
   if (!hit) return { found: false };
   hit.setAttribute('data-cj-target', '1');
+  // 카드 = 이 버튼 하나만 들어 있는 가장 큰 조상. 버튼 글자를 뺀 카드 글자로 횟수 변화를 본다.
+  let card = hit;
+  for (let c = hit.parentElement; c && c !== document.body; c = c.parentElement) {
+    if ([...c.querySelectorAll(CLICK)].filter(visible).length > 1) break;
+    card = c;
+  }
+  const text = textOf(hit);
   return {
-    found: true, via, text: textOf(hit),
+    found: true, via, text,
+    cardText: card === hit ? '' : norm(card.innerText).split(text).join(' '),
     disabled: !!(hit.disabled || hit.getAttribute('aria-disabled') === 'true' || hit.classList.contains('disabled')),
   };
 }
@@ -163,7 +180,10 @@ class _Session:
         self.log = log
         self.step_ms = opts.step_timeout_sec * 1000
         self.dialogs: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self.net: list[tuple[str, object]] = []  # ("response", Response) | ("failed", Request)
         page.on("dialog", self._on_dialog)
+        page.on("response", lambda r: self.net.append(("response", r)))
+        page.on("requestfailed", lambda r: self.net.append(("failed", r)))
 
     async def _on_dialog(self, dialog) -> None:
         self.dialogs.put_nowait((dialog.type, dialog.message))
@@ -207,7 +227,7 @@ class _Session:
 
     async def _jumps_visible(self) -> bool:
         for label in self.opts.jump_labels:
-            if (await self.ev(_FIND_JS, label)).get("found"):
+            if (await self.ev(_FIND_JS, {"label": label, "reuse": False})).get("found"):
                 return True
         return False
 
@@ -305,7 +325,7 @@ class _Session:
 
     async def jump(self, label: str) -> JumpResult:
         try:
-            found = await self.ev(_FIND_JS, label)
+            found = await self.ev(_FIND_JS, {"label": label, "reuse": False})
         except (PWError, CycleError) as exc:
             return JumpResult(label, FAILED, f"페이지 오류: {_short(exc)}")
         if not found["found"]:
@@ -316,7 +336,9 @@ class _Session:
         if found["via"] == "card":
             return JumpResult(label, NO_BUTTON, f"이름이 다른 버튼만 있습니다: {text}")
 
+        before = found
         self._drain()
+        net_mark = len(self.net)
         try:
             await self.page.click("[data-cj-target]", timeout=self.step_ms, no_wait_after=True)
         except PWError as exc:
@@ -338,19 +360,97 @@ class _Session:
         typ, msg = first
         if typ == "alert" and _is_failure(msg):
             return JumpResult(label, FAILED, f"사이트 알림: {msg}")
+        outcome, signal = await self._verify(label, before, net_mark)
+        return JumpResult(label, outcome, f"확인 승인: {msg} → {signal}")
 
-        # 확인 뒤 결과 알림(있을 수 있음)을 잠깐 기다린다.
-        follow = await self._next_dialog(min(1.5, self.opts.dialog_timeout_sec))
-        if follow and _is_failure(follow[1]):
-            return JumpResult(label, FAILED, f"확인 후 사이트 알림: {follow[1]}")
+    async def _verify(self, label: str, before: dict, net_mark: int) -> tuple[str, str]:
+        """확인 승인 뒤 사이트의 실제 결과 신호를 기다린다. 확인 창 승인만으로는 성공이 아니다.
+
+        성공 신호: 성공 알림, 성공 JSON 응답(ok/success=true), 버튼의 쿨다운·비활성 전환, 카드 숫자(횟수) 변화.
+        실패 신호: HTTP 4xx/5xx 응답, 요청 실패, 실패 알림, 실패 JSON 응답(ok/success=false).
+        실패 신호를 먼저 본다. 제한 시간 안에 아무 신호가 없으면 '확인 불가'(성공으로 세지 않음).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.opts.verify_timeout_sec
+        seen = net_mark
+        before_nums = re.findall(r"\d+", before.get("cardText", ""))
+        pending_json: list = []
+        while True:
+            success: str | None = None
+            for _typ, m in self._drain():
+                if _is_failure(m):
+                    return FAILED, f"사이트 알림: {m}"
+                if any(w in m for w in SUCCESS_WORDS):
+                    success = success or f"성공 알림: {m}"
+            while seen < len(self.net):
+                kind, obj = self.net[seen]
+                seen += 1
+                verdict = self._judge_status(kind, obj)
+                if verdict == "json":
+                    pending_json.append(obj)
+                elif verdict:
+                    return verdict  # HTTP 오류·요청 실패
+            if success:
+                return OK, success
+            try:
+                now = await asyncio.wait_for(
+                    self.page.evaluate(_FIND_JS, {"label": label, "reuse": True}), 3)
+            except (PWError, asyncio.TimeoutError):
+                now = {"found": False}  # 페이지 이동 중
+            if now.get("found"):
+                if now["disabled"] or (COOLDOWN_RE.search(now["text"]) and label not in now["text"]):
+                    return OK, f"쿨다운 전환 확인({now['text'] or '비활성'})"
+                after_nums = re.findall(r"\d+", now.get("cardText", ""))
+                if before_nums and after_nums and after_nums != before_nums:
+                    return OK, "횟수 표시 변화 확인"
+            # 화면 신호가 없을 때만 응답 본문(JSON)의 성공/실패 플래그를 읽는다(본문 읽기가 느릴 수 있음).
+            while pending_json:
+                verdict = await self._judge_json(pending_json.pop(0))
+                if verdict:
+                    return verdict
+            if loop.time() >= deadline:
+                return UNVERIFIED, (f"{self.opts.verify_timeout_sec:g}초 안에 사이트의 성공 신호"
+                                    "(쿨다운 전환·횟수 변화·성공 응답)를 확인하지 못했습니다.")
+            await asyncio.sleep(0.3)
+
+    @staticmethod
+    def _judge_status(kind: str, obj):
+        """확인 승인 뒤 페이지가 보낸 요청의 상태. 이미지·스크립트 등 부수 요청은 무시한다.
+
+        실패면 (FAILED, 사유), 본문을 더 봐야 하는 JSON 응답이면 "json", 그 밖에는 None.
+        """
+        if kind == "failed":
+            if obj.resource_type in ("xhr", "fetch", "document"):
+                return FAILED, f"요청 실패: {obj.failure or ''} ({_path(obj.url)})"
+            return None
+        rtype = obj.request.resource_type
+        if rtype not in ("xhr", "fetch", "document"):
+            return None
+        if obj.status >= 400:
+            return FAILED, f"서버가 요청을 거부했습니다: HTTP {obj.status} ({_path(obj.url)})"
+        if rtype in ("xhr", "fetch") and "json" in (obj.headers.get("content-type") or ""):
+            return "json"
+        return None
+
+    @staticmethod
+    async def _judge_json(resp) -> tuple[str, str] | None:
         try:
-            await self.page.wait_for_load_state("domcontentloaded", timeout=self.step_ms)
-        except PWError:
-            pass
-        detail = f"확인 승인: {msg}"
-        if follow:
-            detail += f" → {follow[1]}"
-        return JumpResult(label, OK, detail)
+            body = await asyncio.wait_for(resp.json(), 1.5)
+        except Exception:  # noqa: BLE001 - 본문을 못 읽으면 다른 신호로 판단
+            return None
+        if not isinstance(body, dict):
+            return None
+        flag = body.get("ok", body.get("success"))
+        if flag is True:
+            return OK, f"성공 응답 확인({_path(resp.url)})"
+        if flag is False:
+            reason = body.get("msg") or body.get("message") or body.get("reason") or ""
+            return FAILED, f"사이트 실패 응답: {reason} ({_path(resp.url)})"
+        return None
+
+
+def _path(url: str) -> str:
+    return urlparse(url).path or url
 
 
 def _is_failure(msg: str) -> bool:

@@ -11,6 +11,10 @@
   limit/limit1      확인 뒤 '횟수 초과' 알림
   modal/modal1      브라우저 확인 창 대신 HTML 모달 확인 창
   slow/slow1        로그인 후 페이지 응답이 --slow 초 지연(네트워크 지연)
+  failjump/failjump1  확인 승인 뒤 점프 요청이 HTTP 500, 화면·횟수 변화 없음
+  nosignal/nosignal1  확인 승인 뒤 서버 200(빈 응답)이지만 화면·횟수 변화 없음(성공 신호 없음)
+  reload/reload1    점프 성공 뒤 페이지 새로고침(성공 플래그 없음, 새 화면의 대기 상태로 확인)
+  quiet/quiet1      점프 성공 응답에 성공 플래그 없음(버튼 대기 전환·횟수 변화로만 확인)
   captcha/captcha1  로그인 뒤 자동입력 방지(CAPTCHA) 화면
 조회: GET /api/stats (사용자·점프별 성공 횟수와 기록), 초기화: POST /api/reset
 """
@@ -38,6 +42,7 @@ USERS = {
     "test1": "pass1", "test2": "pass2", "test3": "pass3",
     "cool": "cool1", "nobtn": "nobtn1", "nodialog": "nodialog1", "limit": "limit1",
     "modal": "modal1", "slow": "slow1", "captcha": "captcha1",
+    "failjump": "failjump1", "nosignal": "nosignal1", "reload": "reload1", "quiet": "quiet1",
 }
 DAILY_LIMIT = 50
 
@@ -102,8 +107,10 @@ async function jump(btn){{
   if (USER==='nodialog' && type==='manager') return;
   if(!(await ask(btn.dataset.page+' 페이지에서 우리 업소 카드를 상단으로 점프할까요?'))) return;
   const r=await fetch('/api/jump',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{type}})}});
+  if(!r.ok) return;  // 사이트가 오류를 화면에 알리지 않는 경우(HTTP 500 등)
   const j=await r.json();
-  if(!j.ok){{alert(j.msg);return;}}
+  if(j.ok===false){{alert(j.msg);return;}}
+  if(USER==='reload'){{location.reload();return;}}
   document.getElementById('cnt-'+type).textContent=j.count;
   cool(btn,j.remain);
 }}
@@ -209,6 +216,10 @@ def make_handler(state: State):
                     return self._json({"ok": False, "msg": "로그인이 필요합니다."}, 401)
                 jtype = json.loads(body or "{}").get("type")
                 with state.lock:
+                    if user == "failjump":
+                        return self._json({"error": "internal"}, 500)
+                    if user == "nosignal":
+                        return self._send(200, "", "text/plain; charset=utf-8")
                     if user == "limit":
                         return self._json({"ok": False, "msg": "오늘 점프 횟수를 초과했습니다."})
                     if state.remain(user, jtype) > 0:
@@ -217,7 +228,10 @@ def make_handler(state: State):
                     state.log.append({"user": user, "type": jtype, "sid": sid[:6],
                                       "time": datetime.now().isoformat(timespec="seconds")})
                     cnt = state.count(user, jtype)
-                return self._json({"ok": True, "count": cnt, "remain": state.cooldown})
+                res = {"count": cnt, "remain": state.cooldown}
+                if user not in ("quiet", "reload"):
+                    res["ok"] = True  # quiet/reload는 명시적 성공 플래그 없이 화면 변화로만 알린다
+                return self._json(res)
             self._send(404, "not found")
 
     return H

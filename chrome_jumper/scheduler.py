@@ -173,7 +173,7 @@ class Scheduler:
                 nxt = next_run(datetime.now(), start_mode=acc.start_mode, start_time=acc.start_time,
                                interval_min=acc.interval_min, end_time=acc.end_time or None,
                                last_started=last_started)
-            except ValueError as exc:
+            except (ValueError, TypeError, OverflowError) as exc:  # 잘못된 값은 멈추지 말고 오류 표시
                 st.status, st.next_run = "설정 오류", None
                 self._emit(acc_id)
                 self._log(acc.name, "ERROR", f"예약 계산 실패: {exc}")
@@ -220,7 +220,8 @@ class Scheduler:
                 opts = RunOptions(url=settings.target_url, jump_labels=list(settings.jump_labels),
                                   headless=settings.headless, chrome_path=settings.chrome_path,
                                   step_timeout_sec=settings.step_timeout_sec,
-                                  dialog_timeout_sec=settings.dialog_timeout_sec)
+                                  dialog_timeout_sec=settings.dialog_timeout_sec,
+                                  verify_timeout_sec=settings.verify_timeout_sec)
                 result: CycleResult
                 try:
                     if not opts.url:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import tkinter as tk
 from datetime import datetime
@@ -12,7 +13,7 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__
-from .config import Account, Settings, default_data_dir, validate_url
+from .config import TIMEOUT_RANGES, Account, Settings, default_data_dir, validate_url
 from .scheduler import AccountState, Scheduler
 
 BG, PANEL, FG, MUTED, ACCENT = "#1d1f24", "#262931", "#e7e9ee", "#9aa1ad", "#3d7eff"
@@ -85,7 +86,7 @@ class AccountDialog(tk.Toplevel):
         row("첫 실행", modes)
         self.e_start = ttk.Entry(f, textvariable=self.v_start, width=8)
         row("시작 시각", self.e_start, "HH:MM (24시간). 종료 시각이 있으면 매일 이 시각에 재개")
-        row("반복 주기(분)", ttk.Entry(f, textvariable=self.v_interval, width=8), "예: 10, 30, 60")
+        row("반복 주기(분)", ttk.Entry(f, textvariable=self.v_interval, width=8), "1~10080 (예: 10, 30, 60)")
         self.e_end = ttk.Entry(f, textvariable=self.v_end, width=8)
         row("종료 시각", self.e_end, "선택. 비우면 전체 중지까지 반복, 입력하면 매일 이 시각까지만")
 
@@ -100,9 +101,10 @@ class AccountDialog(tk.Toplevel):
     def _ok(self):
         try:
             try:
-                interval = float(self.v_interval.get())
+                interval = float(self.v_interval.get().strip())
             except ValueError:
                 raise ValueError("반복 주기(분)는 숫자여야 합니다.") from None
+            # inf/nan/1e20 같은 값은 아래 acc.validate()에서 거부된다(1~10080분).
             base = self.account
             acc = Account(
                 name=self.v_name.get().strip(), login_id=self.v_id.get().strip(),
@@ -136,34 +138,39 @@ class AdvancedDialog(tk.Toplevel):
         self.v_step = tk.StringVar(value=f"{s.step_timeout_sec:g}")
         self.v_dialog = tk.StringVar(value=f"{s.dialog_timeout_sec:g}")
         self.v_cycle = tk.StringVar(value=f"{s.cycle_timeout_sec:g}")
+        self.v_verify = tk.StringVar(value=f"{s.verify_timeout_sec:g}")
         items = [
             ("Chrome 실행 파일", self.v_chrome, "비우면 설치된 Chrome 자동 사용", 40),
             ("단계 대기 제한(초)", self.v_step, "페이지 이동·로그인·버튼 대기", 8),
             ("확인 창 대기(초)", self.v_dialog, "버튼 클릭 뒤 확인 창", 8),
+            ("결과 확인 대기(초)", self.v_verify, "확인 뒤 쿨다운·횟수 변화·성공 응답", 8),
             ("한 주기 제한(초)", self.v_cycle, "넘으면 실패 처리 후 Chrome 닫음", 8),
         ]
         for i, (lab, var, hint, w) in enumerate(items):
             ttk.Label(f, text=lab).grid(row=i, column=0, sticky="w", pady=4)
             ttk.Entry(f, textvariable=var, width=w).grid(row=i, column=1, sticky="w", pady=4, padx=8)
             ttk.Label(f, text=hint, style="Muted.TLabel").grid(row=i, column=2, sticky="w")
-        ttk.Label(f, text="점프 버튼 이름\n(한 줄에 하나, 순서대로 클릭)").grid(row=4, column=0, sticky="nw", pady=4)
+        ttk.Label(f, text="점프 버튼 이름\n(한 줄에 하나, 순서대로 클릭)").grid(row=5, column=0, sticky="nw", pady=4)
         self.t_labels = tk.Text(f, width=30, height=5, bg=PANEL, fg=FG, insertbackground=FG, relief="flat")
         self.t_labels.insert("1.0", "\n".join(s.jump_labels))
-        self.t_labels.grid(row=4, column=1, columnspan=2, sticky="w", pady=4, padx=8)
+        self.t_labels.grid(row=5, column=1, columnspan=2, sticky="w", pady=4, padx=8)
         b = ttk.Frame(f)
-        b.grid(row=5, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        b.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(b, text="취소", command=self.destroy).pack(side="right", padx=4)
         ttk.Button(b, text="저장", style="Accent.TButton", command=self._ok).pack(side="right")
         self.grab_set()
 
     def _ok(self):
         try:
-            vals = [float(v.get()) for v in (self.v_step, self.v_dialog, self.v_cycle)]
-            if min(vals) <= 0:
-                raise ValueError
+            vals = [float(v.get()) for v in (self.v_step, self.v_dialog, self.v_cycle, self.v_verify)]
         except ValueError:
-            messagebox.showerror("입력 오류", "시간 값은 0보다 큰 숫자여야 합니다.", parent=self)
+            messagebox.showerror("입력 오류", "시간 값은 숫자여야 합니다.", parent=self)
             return
+        names = ("단계 대기 제한", "확인 창 대기", "한 주기 제한", "결과 확인 대기")
+        for v, name, (lo, hi) in zip(vals, names, TIMEOUT_RANGES):
+            if not (math.isfinite(v) and lo <= v <= hi):
+                messagebox.showerror("입력 오류", f"{name}(초)은 {lo}~{hi} 사이여야 합니다.", parent=self)
+                return
         labels = [x.strip() for x in self.t_labels.get("1.0", "end").splitlines() if x.strip()]
         if not labels:
             messagebox.showerror("입력 오류", "점프 버튼 이름을 하나 이상 입력하세요.", parent=self)
@@ -173,7 +180,7 @@ class AdvancedDialog(tk.Toplevel):
             messagebox.showerror("입력 오류", "Chrome 실행 파일 경로가 없습니다.", parent=self)
             return
         self.s.chrome_path = chrome
-        self.s.step_timeout_sec, self.s.dialog_timeout_sec, self.s.cycle_timeout_sec = vals
+        self.s.step_timeout_sec, self.s.dialog_timeout_sec, self.s.cycle_timeout_sec, self.s.verify_timeout_sec = vals
         self.s.jump_labels = labels
         self.ok = True
         self.destroy()
@@ -190,6 +197,9 @@ class App:
         self.cfg_path = data_dir / "config.json"
         try:
             self.settings = Settings.load(self.cfg_path)
+            if self.settings.load_errors:
+                messagebox.showwarning("설정 확인 필요", "설정 파일에서 잘못된 값을 발견했습니다.\n\n"
+                                       + "\n".join(self.settings.load_errors))
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("설정 오류", f"설정 파일을 읽지 못했습니다: {exc}\n빈 설정으로 시작합니다.")
             self.settings = Settings()
@@ -290,7 +300,7 @@ class App:
             self.tv_det.heading(c, text=h)
             self.tv_det.column(c, width=w, anchor="w")
         for k, v in {"성공": "#3ecf8e", "대기/비활성": "#c9a227", "버튼 없음": "#ff6b6b",
-                     "확인 창 없음": "#ff6b6b", "실패": "#ff6b6b"}.items():
+                     "확인 창 없음": "#ff6b6b", "실패": "#ff6b6b", "확인 불가": "#f5b942"}.items():
             self.tv_det.tag_configure(k, foreground=v)
         self.tv_det.pack(fill="x")
         tv = ttk.Treeview(upper, columns=self.COLS, show="headings", selectmode="browse", height=6)

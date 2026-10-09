@@ -35,4 +35,4 @@ def fresh(mock):
 @pytest.fixture
 def opts(fresh):
     return RunOptions(url=fresh["url"], jump_labels=list(DEFAULT_JUMPS), headless=HEADLESS,
-                      step_timeout_sec=6, dialog_timeout_sec=3)
+                      step_timeout_sec=6, dialog_timeout_sec=3, verify_timeout_sec=3)

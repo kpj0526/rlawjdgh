@@ -16,11 +16,34 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, time, timedelta
+
+# 반복 주기 허용 범위(분). 화면·설정 파일 입력은 USER_MIN 이상만 받는다.
+# 예약 계산은 유한한 양수이고 MAX 이하인지만 본다(테스트용 짧은 주기 허용).
+INTERVAL_USER_MIN = 1
+INTERVAL_MAX = 7 * 24 * 60  # 7일
+
+
+def check_interval(value, minimum: float = 0) -> float:
+    """반복 주기(분)를 검사해 float로 돌려준다. 숫자가 아니거나 inf/nan/범위 밖이면 ValueError."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"반복 주기(분)는 숫자여야 합니다: {value!r}")
+    v = float(value)
+    if not math.isfinite(v):
+        raise ValueError(f"반복 주기(분)가 유한한 숫자가 아닙니다: {value!r}")
+    if v <= 0 or v < minimum:
+        raise ValueError(f"반복 주기(분)는 {minimum:g} 이상이어야 합니다: {value!r}" if minimum
+                         else f"반복 주기(분)는 0보다 커야 합니다: {value!r}")
+    if v > INTERVAL_MAX:
+        raise ValueError(f"반복 주기(분)는 {INTERVAL_MAX}분(7일) 이하여야 합니다: {value!r}")
+    return v
 
 
 def parse_hhmm(value: str) -> time:
-    value = (value or "").strip()
+    if not isinstance(value, str):
+        raise ValueError(f"시각은 HH:MM 형식이어야 합니다: {value!r}")
+    value = value.strip()
     try:
         hh, mm = value.split(":")
         h, m = int(hh), int(mm)
@@ -49,9 +72,7 @@ def next_run(
     last_started: datetime | None = None,
 ) -> datetime:
     """now 이후(now 포함)의 다음 실행 시각."""
-    if interval_min <= 0:
-        raise ValueError("반복 주기는 0보다 커야 합니다.")
-    step = timedelta(minutes=interval_min)
+    step = timedelta(minutes=check_interval(interval_min))
 
     if start_mode not in ("now", "at"):
         raise ValueError(f"알 수 없는 시작 방식: {start_mode!r}")

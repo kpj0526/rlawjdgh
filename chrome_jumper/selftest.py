@@ -1,6 +1,7 @@
 """배포 파일 점검용 자체 시험 모드(사용자 기능 아님).
 
 ChromeJumper.exe --selftest --url http://127.0.0.1:8765/owner --account 이름:아이디:비밀번호 [...] --out 결과.json
+    [--click-gap 초] [--confirm-delay 초]   (점프 간격 확인용. 결과 JSON에 jump_sec·간격 값이 남는다)
 
 - 임시 데이터 폴더를 쓰고 사용자 설정(%APPDATA%\\ChromeJumper)은 읽거나 쓰지 않는다.
 - 지정 계정들을 '즉시 시작'으로 스케줄러에 올려 전체 시작 → 모든 계정 1주기 완료 → 전체 중지까지 실행하고
@@ -21,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
-from .config import Account, Settings, validate_url
+from .config import PACE_RANGE, Account, Settings, validate_url
 
 
 def _parse(argv: list[str]) -> argparse.Namespace:
@@ -32,6 +33,8 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--out", required=True)
     ap.add_argument("--headed", action="store_true", help="Chrome 창을 띄움(기본은 숨김)")
     ap.add_argument("--timeout", type=float, default=180)
+    ap.add_argument("--click-gap", type=float, default=None, help="클릭 간격(초). 생략하면 기본값")
+    ap.add_argument("--confirm-delay", type=float, default=None, help="확인 승인 지연(초). 생략하면 기본값")
     return ap.parse_args(argv)
 
 
@@ -39,6 +42,9 @@ def run(argv: list[str]) -> int:
     try:
         a = _parse(argv)
         url = validate_url(a.url)
+        for name, v in (("--click-gap", a.click_gap), ("--confirm-delay", a.confirm_delay)):
+            if v is not None and not (PACE_RANGE[0] <= v <= PACE_RANGE[1]):
+                raise ValueError(f"{name}는 {PACE_RANGE[0]}~{PACE_RANGE[1]}초여야 합니다: {v}")
         accounts = []
         for spec in a.account:
             name, uid, pw = spec.split(":", 2)
@@ -64,6 +70,10 @@ def run(argv: list[str]) -> int:
             logs.append(f"{data['time']:%H:%M:%S} [{data['account']}] {data['msg']}")
 
     s = Settings(target_url=url, accounts=accounts, headless=not a.headed)
+    if a.click_gap is not None:
+        s.click_gap_sec = a.click_gap
+    if a.confirm_delay is not None:
+        s.confirm_delay_sec = a.confirm_delay
     sch = Scheduler(on_event)
     started = time.time()
     try:
@@ -91,13 +101,15 @@ def run(argv: list[str]) -> int:
             "name": acc.name, "login_id": acc.login_id,
             "status": r.status if r else "결과 없음(시간 초과)",
             "message": r.message if r else "",
+            "jump_sec": round(r.jump_sec, 2) if r and r.jump_sec is not None else None,
             "jumps": [{"label": j.label, "outcome": j.outcome, "detail": j.detail} for j in (r.jumps if r else [])],
         })
     ok = all(x["status"] == "성공" for x in results)
     _write(Path(a.out), {
         "ok": ok, "version": __version__, "frozen": bool(getattr(sys, "frozen", False)),
         "executable": sys.executable, "time": datetime.now().isoformat(timespec="seconds"),
-        "elapsed_sec": round(time.time() - started, 1), "results": results,
+        "elapsed_sec": round(time.time() - started, 1),
+        "click_gap_sec": s.click_gap_sec, "confirm_delay_sec": s.confirm_delay_sec, "results": results,
         "chrome_closed": sum("Chrome 닫음" in x for x in logs),
         "chrome_launched": sum("Chrome 실행(독립 세션)" in x for x in logs),
         "log": logs,

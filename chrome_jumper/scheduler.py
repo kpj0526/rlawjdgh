@@ -1,4 +1,10 @@
-"""계정별 예약 실행기. 별도 스레드의 asyncio 루프에서 동작하며 GUI와는 콜백으로만 통신한다."""
+"""계정별 예약 실행기. 별도 스레드의 asyncio 루프에서 동작하며 GUI와는 콜백으로만 통신한다.
+
+일일 구간(예: 09:00~다음 날 01:00): 구간이 끝나면 계정은 '대기' 상태로 다음 시작 시각(다음 날 09:00)을
+기다렸다가 자동으로 다시 실행한다. 이 대기는 전체 중지가 아니며 앱이 켜져 있는 동안 매일 반복된다.
+긴 대기(수 시간)는 MAX_WAIT_SEC 단위로 나눠 벽시계를 다시 확인한다. PC 절전·시계 보정으로
+타이머가 어긋나도 예정 시각을 지나치지 않으며, 절전 중 예정 시각이 지났으면 깨어난 즉시 실행한다.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ import copy
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 from .config import Settings
@@ -17,6 +23,8 @@ from .schedule import next_run
 logger = logging.getLogger("chrome_jumper")
 
 EventFn = Callable[[str, dict], None]
+
+MAX_WAIT_SEC = 30  # 예약 대기 중 벽시계를 다시 확인하는 최대 간격
 
 
 @dataclass
@@ -30,9 +38,12 @@ class AccountState:
 
 
 class Scheduler:
-    def __init__(self, on_event: EventFn | None = None, run_fn=run_cycle):
+    def __init__(self, on_event: EventFn | None = None, run_fn=run_cycle,
+                 now_fn: Callable[[], datetime] = datetime.now, max_wait_sec: float = MAX_WAIT_SEC):
         self.on_event = on_event or (lambda kind, data: None)
         self.run_fn = run_fn
+        self._now = now_fn  # 예약 계산용 시계(테스트에서 바꿔 끼움)
+        self._max_wait = max_wait_sec
         self.settings = Settings()
         self.states: dict[str, AccountState] = {}
         self.running = False  # 전체 시작 상태
@@ -198,7 +209,10 @@ class Scheduler:
                 await changed.wait()
                 continue
             try:
-                nxt = next_run(datetime.now(), start_mode=acc.start_mode, start_time=acc.start_time,
+                now = self._now()
+                if last_started is not None and now <= last_started:
+                    now = last_started + timedelta(microseconds=1)  # 방금 실행한 슬롯을 다시 잡지 않음
+                nxt = next_run(now, start_mode=acc.start_mode, start_time=acc.start_time,
                                interval_min=acc.interval_min, end_time=acc.end_time or None,
                                last_started=last_started)
             except (ValueError, TypeError, OverflowError) as exc:  # 잘못된 값은 멈추지 말고 오류 표시
@@ -210,23 +224,24 @@ class Scheduler:
             if st.next_run != nxt or st.status != "대기":
                 st.status, st.next_run = "대기", nxt
                 self._emit(acc_id)
-            delay = (nxt - datetime.now()).total_seconds()
-            if delay > 0:
+            # 예정 시각까지 나눠 기다린다(Windows 타이머가 일찍 깨거나 절전으로 늦어져도 벽시계 기준).
+            reschedule = False
+            while (rest := (nxt - self._now()).total_seconds()) > 0:
                 try:
-                    await asyncio.wait_for(changed.wait(), delay)
-                    continue  # 설정이 바뀌어 다시 계산
+                    await asyncio.wait_for(changed.wait(), min(rest, self._max_wait))
+                    reschedule = True  # 설정이 바뀌어 다시 계산
+                    break
                 except asyncio.TimeoutError:
                     pass
-                # Windows 타이머는 수 ms 일찍 깰 수 있으므로 예정 시각까지 마저 기다린다.
-                while (rest := (nxt - datetime.now()).total_seconds()) > 0:
-                    await asyncio.sleep(rest)
+            if reschedule or not self.running:
+                continue
             if self._locks[acc_id].locked():
                 self._log(acc.name, "WARN", "이전 실행이 아직 진행 중이라 이번 예약은 건너뜁니다.")
-                last_started = datetime.now()
+                last_started = self._now()
                 continue
-            last_started = datetime.now()
+            last_started = self._now()
             await self._run_one(acc_id)
-            took = (datetime.now() - last_started).total_seconds() / 60
+            took = (self._now() - last_started).total_seconds() / 60
             if took > acc.interval_min:
                 self._log(acc.name, "WARN",
                           f"실행 시간({took:.1f}분)이 주기({acc.interval_min:g}분)보다 길어 지나간 예약은 건너뜁니다.")
@@ -242,14 +257,16 @@ class Scheduler:
             st.status = "실행 대기"
             self._emit(acc_id)
             async with self._semaphore():
-                st.status, st.last_start = "실행 중", datetime.now()
+                st.status, st.last_start = "실행 중", self._now()
                 self._emit(acc_id)
                 self._log(acc.name, "INFO", "실행 시작" + (" (지금 실행)" if manual else ""))
                 opts = RunOptions(url=settings.target_url, jump_labels=list(settings.jump_labels),
                                   headless=settings.headless, chrome_path=settings.chrome_path,
                                   step_timeout_sec=settings.step_timeout_sec,
                                   dialog_timeout_sec=settings.dialog_timeout_sec,
-                                  verify_timeout_sec=settings.verify_timeout_sec)
+                                  verify_timeout_sec=settings.verify_timeout_sec,
+                                  click_gap_sec=settings.click_gap_sec,
+                                  confirm_delay_sec=settings.confirm_delay_sec)
                 result: CycleResult
                 try:
                     if not opts.url:

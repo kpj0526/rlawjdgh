@@ -173,3 +173,68 @@ def test_gui_advanced_rejects_bad_timeouts(field, text, monkeypatch, tk_root):
     finally:
         if d.winfo_exists():
             d.destroy()
+
+
+# ---------------------------------------------------------------- 요청 005: 점프 간격 설정
+
+@pytest.mark.parametrize("field,text", [("v_gap", "-1"), ("v_gap", "11"), ("v_gap", "nan"), ("v_confirm", "inf"),
+                                        ("v_confirm", "abc")])
+def test_gui_advanced_rejects_bad_pacing(field, text, monkeypatch, tk_root):
+    from tkinter import messagebox
+
+    from chrome_jumper.app import AdvancedDialog
+    errors = []
+    monkeypatch.setattr(messagebox, "showerror", lambda title, msg, **k: errors.append(msg))
+    s = Settings()
+    d = AdvancedDialog(tk_root, s)
+    try:
+        getattr(d, field).set(text)
+        d._ok()
+        assert not d.ok and errors and ("클릭 간격" in errors[-1] or "확인 승인 지연" in errors[-1])
+        assert (s.click_gap_sec, s.confirm_delay_sec) == (0.5, 0.4)
+    finally:
+        if d.winfo_exists():
+            d.destroy()
+
+
+def test_gui_advanced_saves_pacing(monkeypatch, tk_root):
+    from chrome_jumper.app import AdvancedDialog
+    s = Settings()
+    d = AdvancedDialog(tk_root, s)
+    d.v_gap.set("1.5")
+    d.v_confirm.set("0")
+    d._ok()
+    assert d.ok and (s.click_gap_sec, s.confirm_delay_sec) == (1.5, 0.0)
+
+
+def test_settings_load_fixes_bad_pacing(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"click_gap_sec": -3, "confirm_delay_sec": "x"}), encoding="utf-8")
+    s = Settings.load(path)
+    assert (s.click_gap_sec, s.confirm_delay_sec) == (0.5, 0.4)
+    assert sum("click_gap_sec" in e or "confirm_delay_sec" in e for e in s.load_errors) == 2
+    s.click_gap_sec, s.confirm_delay_sec = 2, 1.25
+    s.save(path)
+    s2 = Settings.load(path)
+    assert (s2.click_gap_sec, s2.confirm_delay_sec) == (2, 1.25) and not s2.load_errors
+
+
+def test_scheduler_passes_pacing_to_runner():
+    seen = []
+
+    async def fake(opts, uid, pw, log):
+        seen.append((opts.click_gap_sec, opts.confirm_delay_sec))
+        return CycleResult("성공", "ok")
+
+    sch = Scheduler(run_fn=fake)
+    s = Settings(target_url="http://x/", click_gap_sec=1.5, confirm_delay_sec=0.9)
+    a = Account(name="A", login_id="a")
+    a.set_password("p")
+    s.accounts.append(a)
+    sch.update_settings(s)
+    sch.run_now(a.id)
+    deadline = time.time() + 3
+    while time.time() < deadline and not seen:
+        time.sleep(0.05)
+    sch.shutdown()
+    assert seen == [(1.5, 0.9)]

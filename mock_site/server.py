@@ -1,6 +1,6 @@
 """로컬 모의 사이트: 로그인 → 업소 정보(점프 4종) → 확인 창 → 대기(쿨다운) 흐름을 재현한다.
 
-실행: python -m mock_site.server [--port 8765] [--cooldown 600] [--slow 40]
+실행: python -m mock_site.server [--port 8765] [--cooldown 600] [--slow 40] [--slowjump 1.5]
 대상 URL: http://127.0.0.1:8765/owner
 
 테스트 계정(아이디/비밀번호) — 실제 계정 아님:
@@ -16,7 +16,14 @@
   reload/reload1    점프 성공 뒤 페이지 새로고침(성공 플래그 없음, 새 화면의 대기 상태로 확인)
   quiet/quiet1      점프 성공 응답에 성공 플래그 없음(버튼 대기 전환·횟수 변화로만 확인)
   captcha/captcha1  로그인 뒤 자동입력 방지(CAPTCHA) 화면
-조회: GET /api/stats (사용자·점프별 성공 횟수와 기록), 초기화: POST /api/reset
+  pace/pace1        너무 빠른 조작을 거부(실사이트 의심 원인 재현): 점프 화면이 뜬 뒤 PACE_GAP초 안에 첫 버튼을
+                    누르거나, 직전 점프 응답 뒤 PACE_GAP초 안에 다음 버튼을 누르거나, 확인 창이 뜬 지
+                    PACE_CONFIRM초 안에 승인하면 '너무 빠릅니다' 류의 실패 알림
+  slowjump/slowjump1  점프 요청 응답이 --slowjump 초 지연(느린 사이트, 성공은 정상 신호로 확인)
+조회: GET /api/stats (사용자·점프별 성공 횟수와 기록, requests: 모든 점프 요청의 시각 기록), 초기화: POST /api/reset
+
+시각 기록(requests): 점프 화면 스크립트가 실행된 시각(loaded), 버튼 클릭 시 확인 창을 띄운 시각(asked), 확인이 승인된 시각(answered)을
+점프 요청에 실어 보내고, 서버가 요청을 받은 시각(ts)과 응답한 시각(done)을 붙인다(모두 epoch 초, 같은 PC 시계).
 """
 
 from __future__ import annotations
@@ -43,25 +50,31 @@ USERS = {
     "cool": "cool1", "nobtn": "nobtn1", "nodialog": "nodialog1", "limit": "limit1",
     "modal": "modal1", "slow": "slow1", "captcha": "captcha1",
     "failjump": "failjump1", "nosignal": "nosignal1", "reload": "reload1", "quiet": "quiet1",
+    "pace": "pace1", "slowjump": "slowjump1",
 }
 DAILY_LIMIT = 50
+PACE_CONFIRM = 0.25  # pace 계정: 확인 창 표시~승인 최소 시간(초)
+PACE_GAP = 0.35  # pace 계정: 직전 점프 응답~다음 버튼 클릭 최소 시간(초)
 
 
 class State:
-    def __init__(self, cooldown: float, slow: float):
+    def __init__(self, cooldown: float, slow: float, slowjump: float = 1.5):
         self.cooldown = cooldown
         self.slow = slow
+        self.slowjump = slowjump
         self.lock = threading.Lock()
         self.sessions: dict[str, str] = {}
         self.until: dict[tuple[str, str], float] = {}
         self.log: list[dict] = []
         self.logins: list[dict] = []
+        self.requests: list[dict] = []  # 모든 점프 요청(성공·거부)의 시각 기록
 
     def reset(self):
         with self.lock:
             self.until.clear()
             self.log.clear()
             self.logins.clear()
+            self.requests.clear()
 
     def remain(self, user: str, jtype: str) -> float:
         if user == "cool":
@@ -93,6 +106,7 @@ OWNER_PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8"><titl
 <div class="modal" role="dialog" id="mdl"><div><p id="mdlmsg"></p><button id="mok">확인</button> <button id="mno">취소</button></div></div>
 <script>
 const USER = {user_js};
+const LOADED = Date.now()/1000;  // 점프 화면 스크립트 실행 시각(첫 클릭 전 안정화 간격 측정)
 function fmt(s){{s=Math.ceil(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}}
 function cool(btn, sec){{btn.disabled=true;const end=Date.now()+sec*1000;
   const t=()=>{{const r=(end-Date.now())/1000;if(r<=0){{btn.disabled=false;btn.textContent=btn.dataset.label;return;}}btn.textContent='대기 '+fmt(r);setTimeout(t,500);}};t();}}
@@ -105,8 +119,10 @@ function ask(msg){{
 async function jump(btn){{
   const type=btn.dataset.type;
   if (USER==='nodialog' && type==='manager') return;
+  const asked=Date.now()/1000;
   if(!(await ask(btn.dataset.page+' 페이지에서 우리 업소 카드를 상단으로 점프할까요?'))) return;
-  const r=await fetch('/api/jump',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{type}})}});
+  const answered=Date.now()/1000;
+  const r=await fetch('/api/jump',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{type,loaded:LOADED,asked,answered}})}});
   if(!r.ok) return;  // 사이트가 오류를 화면에 알리지 않는 경우(HTTP 500 등)
   const j=await r.json();
   if(j.ok===false){{alert(j.msg);return;}}
@@ -182,7 +198,8 @@ def make_handler(state: State):
                     for e in state.log:
                         counts.setdefault(e["user"], {}).setdefault(e["type"], 0)
                         counts[e["user"]][e["type"]] += 1
-                    return self._json({"counts": counts, "log": state.log, "logins": state.logins})
+                    return self._json({"counts": counts, "log": state.log, "logins": state.logins,
+                                       "requests": state.requests})
             if u.path == "/owner":
                 if not user:
                     return self._redirect("/login?next=/owner")
@@ -231,25 +248,48 @@ def make_handler(state: State):
                 sid, user = self._user()
                 if not user:
                     return self._json({"ok": False, "msg": "로그인이 필요합니다."}, 401)
-                jtype = json.loads(body or "{}").get("type")
+                req = json.loads(body or "{}")
+                rec = {"user": user, "type": req.get("type"), "loaded": req.get("loaded"), "asked": req.get("asked"),
+                       "answered": req.get("answered"), "ts": time.time()}
+                res, code = self._jump(user, sid, req)
+                rec.update(done=time.time(), code=code, ok=bool(res and res.get("ok", code == 200)))
                 with state.lock:
-                    if user == "failjump":
-                        return self._json({"error": "internal"}, 500)
-                    if user == "nosignal":
-                        return self._send(200, "", "text/plain; charset=utf-8")
-                    if user == "limit":
-                        return self._json({"ok": False, "msg": "오늘 점프 횟수를 초과했습니다."})
-                    if state.remain(user, jtype) > 0:
-                        return self._json({"ok": False, "msg": "재점프 대기 시간이 남아 있어 점프할 수 없습니다."})
-                    state.until[(user, jtype)] = time.time() + state.cooldown
-                    state.log.append({"user": user, "type": jtype, "sid": sid[:6],
-                                      "time": datetime.now().isoformat(timespec="seconds")})
-                    cnt = state.count(user, jtype)
-                res = {"count": cnt, "remain": state.cooldown}
-                if user not in ("quiet", "reload"):
-                    res["ok"] = True  # quiet/reload는 명시적 성공 플래그 없이 화면 변화로만 알린다
-                return self._json(res)
+                    state.requests.append(rec)
+                if res is None:
+                    return self._send(code, "", "text/plain; charset=utf-8")
+                return self._json(res, code)
             self._send(404, "not found")
+
+        def _jump(self, user: str, sid: str, req: dict) -> tuple[dict | None, int]:
+            jtype = req.get("type")
+            if user == "slowjump":
+                time.sleep(state.slowjump)
+            with state.lock:
+                if user == "pace":
+                    prev = [r for r in state.requests if r["user"] == user]
+                    asked, answered = req.get("asked") or 0, req.get("answered") or 0
+                    if answered - asked < PACE_CONFIRM:
+                        return {"ok": False, "msg": "확인을 너무 빨리 눌렀습니다. 잠시 후에 다시 시도하세요."}, 200
+                    if not prev and asked - (req.get("loaded") or 0) < PACE_GAP:
+                        return {"ok": False, "msg": "페이지가 준비되기 전에 눌렀습니다. 잠시 후에 다시 시도하세요."}, 200
+                    if prev and asked - prev[-1]["done"] < PACE_GAP:
+                        return {"ok": False, "msg": "요청이 너무 빠릅니다. 잠시 후에 다시 시도하세요."}, 200
+                if user == "failjump":
+                    return {"error": "internal"}, 500
+                if user == "nosignal":
+                    return None, 200
+                if user == "limit":
+                    return {"ok": False, "msg": "오늘 점프 횟수를 초과했습니다."}, 200
+                if state.remain(user, jtype) > 0:
+                    return {"ok": False, "msg": "재점프 대기 시간이 남아 있어 점프할 수 없습니다."}, 200
+                state.until[(user, jtype)] = time.time() + state.cooldown
+                state.log.append({"user": user, "type": jtype, "sid": sid[:6],
+                                  "time": datetime.now().isoformat(timespec="seconds")})
+                cnt = state.count(user, jtype)
+            res = {"count": cnt, "remain": state.cooldown}
+            if user not in ("quiet", "reload"):
+                res["ok"] = True  # quiet/reload는 명시적 성공 플래그 없이 화면 변화로만 알린다
+            return res, 200
 
     return H
 
@@ -259,8 +299,9 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-def serve(port: int = 8765, cooldown: float = 600, slow: float = 40, host: str = "127.0.0.1"):
-    state = State(cooldown, slow)
+def serve(port: int = 8765, cooldown: float = 600, slow: float = 40, host: str = "127.0.0.1",
+          slowjump: float = 1.5):
+    state = State(cooldown, slow, slowjump)
     httpd = _Server((host, port), make_handler(state))
     httpd.daemon_threads = True
     httpd.handle_error = lambda request, client_address: None  # 브라우저가 끊은 연결 소음 제거
@@ -272,8 +313,9 @@ def main():
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--cooldown", type=float, default=600, help="점프 후 대기 시간(초). 주기 테스트는 0 권장")
     ap.add_argument("--slow", type=float, default=40, help="slow 계정의 응답 지연(초)")
+    ap.add_argument("--slowjump", type=float, default=1.5, help="slowjump 계정의 점프 응답 지연(초)")
     a = ap.parse_args()
-    httpd, _ = serve(a.port, a.cooldown, a.slow)
+    httpd, _ = serve(a.port, a.cooldown, a.slow, slowjump=a.slowjump)
     print(f"모의 사이트 실행 중: http://127.0.0.1:{httpd.server_port}/owner  (Ctrl+C 종료)", flush=True)
     try:
         httpd.serve_forever()

@@ -86,3 +86,15 @@ def test_log_shows_per_button_results_and_errors(app):
     assert "[가게A] 라인업/PR 점프: 성공" in text
     assert "[가게A] 홍보관 점프: 버튼 없음 - 버튼을 찾지 못했습니다." in text
     assert "실행 종료: 부분 성공" in text
+
+
+def test_daily_resume_hint_is_shown(app):
+    """요청 005: 종료 시각 뒤 대기는 전체 중지가 아니고 다음 날 자동 재개된다는 안내가 화면에 있다."""
+    texts = " ".join(_texts(app.root))
+    assert "다음 날 시작 시각에 자동 재개" in texts and "전체 중지 아님" in texts
+
+
+def test_next_day_resume_time_shows_date(app):
+    from datetime import timedelta
+    tomorrow9 = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    assert appmod.fmt_dt(tomorrow9) == tomorrow9.strftime("%m-%d 09:00")

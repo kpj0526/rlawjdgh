@@ -151,3 +151,74 @@ def test_overall_never_counts_unverified_as_success():
     assert _overall([j(UNVERIFIED)] * 4) == "실패"
     assert _overall([j(OK)] * 3 + [j(UNVERIFIED)]) == "부분 성공"
     assert _overall([j(OK)] * 4) == "성공"
+
+
+# ---------------------------------------------------------------- 요청 005: 점프 간격·속도
+
+TOL = 0.03  # 타이머 해상도 여유(초)
+
+
+def _requests(state, user):
+    return [r for r in state.requests if r["user"] == user]
+
+
+def test_default_pacing_is_observed_by_site_and_within_target(opts, fresh):
+    """페이지가 직접 잰 시각으로 첫 클릭 전 안정화·확인 승인 지연·다음 클릭 간격을 확인한다."""
+    assert (opts.click_gap_sec, opts.confirm_delay_sec) == (0.5, 0.4)  # 기본값
+    res, logs = run(opts, "test1", "pass1")
+    assert res.status == "성공", res.message
+    reqs = _requests(fresh["state"], "test1")
+    assert len(reqs) == 4
+    assert reqs[0]["asked"] - reqs[0]["loaded"] >= 0.5 - TOL  # 점프 화면 표시 뒤 첫 클릭까지
+    for r in reqs:
+        assert r["answered"] - r["asked"] >= 0.4 - TOL, r  # 확인 창 표시 → 승인
+    for prev, nxt in zip(reqs, reqs[1:]):
+        assert nxt["asked"] - prev["done"] >= 0.5 - TOL, (prev, nxt)  # 직전 점프 응답 → 다음 클릭
+    # 빠른 모의 사이트에서 로그인 뒤 점프 구간 목표: 약 5초 이내
+    assert res.jump_sec is not None and res.jump_sec <= 5.0, res.jump_sec
+    assert any(m.startswith("로그인 후 점프 4종 처리") and "클릭 간격 0.5초" in m for _, m in logs)
+
+
+def test_pace_site_rejects_back_to_back_clicks_without_gaps(opts, fresh):
+    """간격을 0으로 두면 빠른 조작을 거부하는 사이트에서 실패한다(의심 원인 재현). 실패 신호로 기록된다."""
+    o = RunOptions(**{**opts.__dict__, "click_gap_sec": 0, "confirm_delay_sec": 0})
+    res, logs = run(o, "pace", "pace1")
+    assert outcomes(res) == [FAILED] * 4, res.jumps
+    assert all("잠시 후에 다시" in j.detail for j in res.jumps)
+    assert fresh["state"].log == []  # 서버 기준 실제 점프 0회
+    assert any("클릭 간격·확인 승인 지연" in m for _, m in logs)  # 늘리는 방법 안내
+    assert_closed(logs)
+
+
+def test_pace_site_succeeds_with_default_gaps(opts, fresh):
+    res, logs = run(opts, "pace", "pace1")
+    assert outcomes(res) == [OK] * 4, res.jumps
+    assert len(fresh["state"].log) == 4
+    assert all(r["ok"] for r in _requests(fresh["state"], "pace"))
+    assert not any("클릭 간격·확인 승인 지연" in m for _, m in logs)
+
+
+def test_pacing_is_configurable(opts, fresh):
+    o = RunOptions(**{**opts.__dict__, "click_gap_sec": 1.0, "confirm_delay_sec": 0.8})
+    res, _ = run(o, "test2", "pass2")
+    assert res.status == "성공", res.message
+    reqs = _requests(fresh["state"], "test2")
+    assert reqs[0]["asked"] - reqs[0]["loaded"] >= 1.0 - TOL
+    assert all(r["answered"] - r["asked"] >= 0.8 - TOL for r in reqs)
+    assert all(b["asked"] - a["done"] >= 1.0 - TOL for a, b in zip(reqs, reqs[1:]))
+
+
+def test_modal_confirm_is_also_delayed(opts, fresh):
+    res, _ = run(opts, "modal", "modal1")
+    assert outcomes(res) == [OK] * 4, res.jumps
+    assert all(r["answered"] - r["asked"] >= 0.4 - TOL for r in _requests(fresh["state"], "modal"))
+
+
+def test_slow_site_exceeds_five_seconds_but_is_not_cut_off(opts, fresh):
+    """느린 사이트(점프 응답 1.5초): 5초 목표를 넘어도 중단하지 않고 성공 신호로 완료를 기록한다."""
+    res, logs = run(opts, "slowjump", "slowjump1")
+    assert outcomes(res) == [OK] * 4, res.jumps
+    assert res.status == "성공"
+    assert res.jump_sec > 5.0
+    assert len(fresh["state"].log) == 4
+    assert_closed(logs)

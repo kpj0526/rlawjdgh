@@ -2,6 +2,12 @@
 
 계정마다 Chrome을 따로 실행(임시 프로필)하므로 쿠키·로그인 상태가 섞이지 않는다.
 중지는 asyncio 작업 취소로 전달되며, 어떤 경우에도 finally에서 자기 Chrome을 닫는다.
+
+점프 속도(요청 005): 사이트가 너무 빠른 연속 요청을 거부하지 않도록 단계 사이에 짧은 간격을 둔다.
+- 클릭 간격(click_gap_sec): 각 점프 버튼을 누르기 전(첫 버튼 포함) 직전 단계가 끝난 뒤 기다리는 시간.
+- 확인 승인 지연(confirm_delay_sec): 확인 창(브라우저 기본 창·HTML 모달)이 뜬 뒤 '확인'을 누르기까지의 시간.
+로그인 뒤 점프 구간은 빠른 사이트에서 계정당 약 5초 이내가 목표지만 강제 제한은 아니다.
+느린 응답은 기존 단계별 시간 제한과 성공/실패 신호 검증으로 판정한다.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ class CycleResult:
     jumps: list[JumpResult] = field(default_factory=list)
     started: datetime = field(default_factory=datetime.now)
     finished: datetime | None = None
+    jump_sec: float | None = None  # 로그인 성공 뒤 점프 화면 확보~마지막 점프 판정까지 걸린 시간
 
     def summary(self) -> str:
         if not self.jumps:
@@ -65,6 +72,8 @@ class RunOptions:
     step_timeout_sec: float = 20
     dialog_timeout_sec: float = 5
     verify_timeout_sec: float = 8
+    click_gap_sec: float = 0.5
+    confirm_delay_sec: float = 0.4
 
 
 _FIND_JS = r"""
@@ -180,17 +189,28 @@ class _Session:
         self.log = log
         self.step_ms = opts.step_timeout_sec * 1000
         self.dialogs: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self.loop = asyncio.get_running_loop()
+        self.marks: list[tuple[str, float]] = []  # (단계, loop.time()) - 간격 확인용 기록
         self.net: list[tuple[str, object]] = []  # ("response", Response) | ("failed", Request)
         page.on("dialog", self._on_dialog)
         page.on("response", lambda r: self.net.append(("response", r)))
         page.on("requestfailed", lambda r: self.net.append(("failed", r)))
 
+    def mark(self, what: str) -> None:
+        self.marks.append((what, self.loop.time()))
+
     async def _on_dialog(self, dialog) -> None:
-        self.dialogs.put_nowait((dialog.type, dialog.message))
+        # 확인 창이 뜨자마자 승인하지 않고 잠시 기다린다(사이트 스크립트가 준비될 시간).
+        # 승인한 뒤에 큐에 넣으므로 점프 흐름은 승인이 끝난 다음에 결과 확인을 시작한다.
+        self.mark("dialog")
         try:
+            await asyncio.sleep(self.opts.confirm_delay_sec)
             await dialog.accept()  # 사이트 확인 창의 '확인'
+            self.mark("accept")
         except PWError:
             pass
+        finally:
+            self.dialogs.put_nowait((dialog.type, dialog.message))
 
     def _drain(self) -> list[tuple[str, str]]:
         out = []
@@ -348,23 +368,18 @@ class _Session:
             return JumpResult(label, NO_BUTTON, f"이름이 다른 버튼만 있습니다: {text}")
 
         before = found
+        # 직전 단계(점프 화면 표시 또는 이전 점프 판정) 뒤 잠시 쉬고 누른다. 버튼을 다시 찾지 않도록
+        # 표시해 둔 버튼을 그대로 누르며, 쉬는 사이 사라졌으면 클릭 실패로 기록된다.
+        await asyncio.sleep(self.opts.click_gap_sec)
         self._drain()
         net_mark = len(self.net)
+        self.mark("click")
         try:
             await self.page.click("[data-cj-target]", timeout=self.step_ms, no_wait_after=True)
         except PWError as exc:
             return JumpResult(label, FAILED, f"클릭 실패: {_short(exc)}")
 
-        first = await self._next_dialog(self.opts.dialog_timeout_sec)
-        if first is None:
-            # 브라우저 기본 창이 아닌 HTML 모달 확인 창 대응
-            try:
-                modal = await self.ev(_HTML_CONFIRM_JS)
-                if modal is not None:
-                    await self.page.click("[data-cj-ok]", timeout=self.step_ms)
-                    first = ("modal", modal)
-            except (PWError, CycleError):
-                pass
+        first = await self._await_confirm()
         if first is None:
             return JumpResult(label, NO_DIALOG, f"{self.opts.dialog_timeout_sec:g}초 안에 확인 창이 나타나지 않았습니다.")
 
@@ -373,6 +388,32 @@ class _Session:
             return JumpResult(label, FAILED, f"사이트 알림: {msg}")
         outcome, signal = await self._verify(label, before, net_mark)
         return JumpResult(label, outcome, f"확인 승인: {msg} → {signal}")
+
+    async def _await_confirm(self) -> tuple[str, str] | None:
+        """클릭 뒤 확인 창을 기다려 승인한다. 브라우저 기본 창은 _on_dialog가 지연 후 승인하고,
+        HTML 모달 확인 창은 여기서 같은 지연 뒤 '확인'을 누른다. 제한 시간 안에 없으면 None."""
+        deadline = self.loop.time() + self.opts.dialog_timeout_sec
+        while True:
+            got = await self._next_dialog(max(0.0, min(0.25, deadline - self.loop.time())))
+            if got is not None:
+                return got
+            try:
+                modal = await self.ev(_HTML_CONFIRM_JS)
+            except (PWError, CycleError):
+                modal = None
+            if modal is not None:
+                self.mark("dialog")
+                await asyncio.sleep(self.opts.confirm_delay_sec)
+                try:
+                    await self.page.click("[data-cj-ok]", timeout=self.step_ms)
+                except PWError:
+                    return None
+                self.mark("accept")
+                return "modal", modal
+            if not self.dialogs.empty():
+                continue  # 모달을 찾는 사이 기본 확인 창이 승인됨
+            if self.loop.time() >= deadline:
+                return None
 
     async def _verify(self, label: str, before: dict, net_mark: int) -> tuple[str, str]:
         """확인 승인 뒤 사이트의 실제 결과 신호를 기다린다. 확인 창 승인만으로는 성공이 아니다.
@@ -422,7 +463,7 @@ class _Session:
             if loop.time() >= deadline:
                 return UNVERIFIED, (f"{self.opts.verify_timeout_sec:g}초 안에 사이트의 성공 신호"
                                     "(쿨다운 전환·횟수 변화·성공 응답)를 확인하지 못했습니다.")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)
 
     @staticmethod
     def _judge_status(kind: str, obj):
@@ -509,12 +550,19 @@ async def run_cycle(opts: RunOptions, login_id: str, password: str, log: LogFn) 
         await s.check_captcha()
         await s.login(login_id, password)
         log("INFO", "로그인 성공")
+        t0 = s.loop.time()
         await s.open_jump_page()
 
         for label in opts.jump_labels:
             jr = await s.jump(label)
             result.jumps.append(jr)
             log("INFO" if jr.outcome == OK else "WARN", f"{label}: {jr.outcome} - {jr.detail}")
+        result.jump_sec = s.loop.time() - t0
+        log("INFO", f"로그인 후 점프 {len(result.jumps)}종 처리 {result.jump_sec:.1f}초 "
+                    f"(클릭 간격 {opts.click_gap_sec:g}초, 확인 승인 지연 {opts.confirm_delay_sec:g}초)")
+        if any(j.outcome in (FAILED, UNVERIFIED, NO_DIALOG) for j in result.jumps):
+            log("WARN", "사이트가 빠른 연속 조작을 거부하는 경우일 수 있습니다. 같은 실패가 반복되면 "
+                        "고급 설정에서 클릭 간격·확인 승인 지연을 0.5초씩 늘려 보세요.")
         result.status = _overall(result.jumps)
         result.message = result.summary()
     except asyncio.CancelledError:

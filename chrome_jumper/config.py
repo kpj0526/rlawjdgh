@@ -17,6 +17,8 @@ from .schedule import INTERVAL_USER_MIN, check_interval, parse_hhmm
 
 # 시간 제한 허용 범위(초): 단계, 확인 창, 한 주기, 결과 확인 순서
 TIMEOUT_RANGES = ((1, 600), (1, 120), (10, 3600), (1, 120))
+# 점프 간격 허용 범위(초): 클릭 간격, 확인 승인 지연. 0이면 간격 없음(권장하지 않음).
+PACE_RANGE = (0, 10)
 
 DEFAULT_JUMPS = ["라인업/PR 점프", "실시간 출근부 점프", "매니저 출근부 점프", "홍보관 점프"]
 
@@ -149,6 +151,9 @@ class Settings:
     dialog_timeout_sec: float = 5  # 버튼 클릭 뒤 확인 창 대기 제한
     verify_timeout_sec: float = 8  # 확인 승인 뒤 사이트 성공 신호 대기 제한
     cycle_timeout_sec: float = 180  # 한 주기 전체 제한
+    # 점프 간격(요청 005). 실제 사이트가 빠른 연속 조작을 거부하면 늘린다.
+    click_gap_sec: float = 0.5  # 점프 화면 표시·직전 점프 판정 뒤 다음 버튼 클릭까지
+    confirm_delay_sec: float = 0.4  # 확인 창이 뜬 뒤 '확인' 승인까지
 
     # -------- 저장
     # 설정 파일을 읽을 때 발견한 문제(화면에 알림). 저장하지 않는다.
@@ -187,6 +192,13 @@ class Settings:
         default = Settings()
         names = ("step_timeout_sec", "dialog_timeout_sec", "cycle_timeout_sec", "verify_timeout_sec")
         for name, (lo, hi) in zip(names, TIMEOUT_RANGES):
+            v = getattr(self, name)
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and lo <= v <= hi
+            if not ok:
+                errors.append(f"옵션 {name}={v!r} 이(가) 잘못되어 기본값 {getattr(default, name)}(으)로 바꿨습니다.")
+                setattr(self, name, getattr(default, name))
+        lo, hi = PACE_RANGE
+        for name in ("click_gap_sec", "confirm_delay_sec"):
             v = getattr(self, name)
             ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and lo <= v <= hi
             if not ok:

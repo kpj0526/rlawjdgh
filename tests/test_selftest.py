@@ -24,3 +24,23 @@ def test_selftest_bad_args(tmp_path):
     out = tmp_path / "r.json"
     assert selftest.run(["--selftest", "--url", "ftp://x", "--account", "A:a:p", "--out", str(out)]) == 2
     assert "인자 오류" in json.loads(out.read_text(encoding="utf-8"))["error"]
+
+
+def test_selftest_reports_jump_time_and_custom_pacing(fresh, tmp_path, monkeypatch):
+    monkeypatch.delenv("CHROME_JUMPER_DATA", raising=False)
+    out = tmp_path / "r.json"
+    code = selftest.run(["--selftest", "--url", fresh["url"], "--account", "P:pace:pace1", "--out", str(out),
+                         "--click-gap", "0.8", "--confirm-delay", "0.6", "--timeout", "90"])
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert code == 0 and data["ok"], data["results"]
+    assert (data["click_gap_sec"], data["confirm_delay_sec"]) == (0.8, 0.6)
+    assert data["results"][0]["jump_sec"] > 4 * (0.8 + 0.6) - 0.1
+    reqs = [r for r in fresh["state"].requests if r["user"] == "pace"]
+    assert all(r["answered"] - r["asked"] >= 0.6 - 0.03 for r in reqs)
+
+
+def test_selftest_rejects_bad_pacing(tmp_path):
+    out = tmp_path / "r.json"
+    assert selftest.run(["--selftest", "--url", "http://127.0.0.1:1/", "--account", "A:a:p", "--out", str(out),
+                         "--click-gap", "-1"]) == 2
+    assert "--click-gap" in json.loads(out.read_text(encoding="utf-8"))["error"]

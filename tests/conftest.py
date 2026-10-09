@@ -18,7 +18,7 @@ HEADLESS = os.environ.get("CJ_TEST_HEADED") != "1"
 
 @pytest.fixture(scope="session")
 def mock():
-    httpd, state = serve(0, cooldown=600, slow=30)
+    httpd, state = serve(0, cooldown=600, slow=30, slowjump=1.5)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     yield {"url": f"http://127.0.0.1:{httpd.server_port}/owner", "state": state, "port": httpd.server_port}

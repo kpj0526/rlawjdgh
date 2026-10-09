@@ -14,7 +14,7 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__
-from .config import TIMEOUT_RANGES, Account, Settings, default_data_dir, validate_url
+from .config import PACE_RANGE, TIMEOUT_RANGES, Account, Settings, default_data_dir, validate_url
 from .scheduler import AccountState, Scheduler
 
 BG, PANEL, FG, MUTED, ACCENT = "#1d1f24", "#262931", "#e7e9ee", "#9aa1ad", "#3d7eff"
@@ -89,7 +89,8 @@ class AccountDialog(tk.Toplevel):
         row("시작 시각", self.e_start, "HH:MM (24시간). 종료 시각이 있으면 매일 이 시각에 재개")
         row("반복 주기(분)", ttk.Entry(f, textvariable=self.v_interval, width=8), "1~10080 (예: 10, 30, 60)")
         self.e_end = ttk.Entry(f, textvariable=self.v_end, width=8)
-        row("종료 시각", self.e_end, "선택. 비우면 전체 중지까지 반복, 입력하면 매일 이 시각까지만")
+        row("종료 시각", self.e_end, "선택. 비우면 전체 중지까지 반복. 입력하면 매일 이 시각까지\n"
+                                     "실행한 뒤 대기하다 다음 날 시작 시각에 자동 재개(예: 09:00~01:00)")
 
         btns = ttk.Frame(f)
         btns.grid(row=r, column=0, columnspan=3, sticky="e", pady=(12, 0))
@@ -140,23 +141,31 @@ class AdvancedDialog(tk.Toplevel):
         self.v_dialog = tk.StringVar(value=f"{s.dialog_timeout_sec:g}")
         self.v_cycle = tk.StringVar(value=f"{s.cycle_timeout_sec:g}")
         self.v_verify = tk.StringVar(value=f"{s.verify_timeout_sec:g}")
+        self.v_gap = tk.StringVar(value=f"{s.click_gap_sec:g}")
+        self.v_confirm = tk.StringVar(value=f"{s.confirm_delay_sec:g}")
         items = [
             ("Chrome 실행 파일", self.v_chrome, "비우면 설치된 Chrome 자동 사용", 40),
             ("단계 대기 제한(초)", self.v_step, "페이지 이동·로그인·버튼 대기", 8),
             ("확인 창 대기(초)", self.v_dialog, "버튼 클릭 뒤 확인 창", 8),
             ("결과 확인 대기(초)", self.v_verify, "확인 뒤 쿨다운·횟수 변화·성공 응답", 8),
             ("한 주기 제한(초)", self.v_cycle, "넘으면 실패 처리 후 Chrome 닫음", 8),
+            ("클릭 간격(초)", self.v_gap, "점프 화면이 뜬 뒤 첫 버튼·이전 점프 판정 뒤 다음 버튼까지 (기본 0.5)", 8),
+            ("확인 승인 지연(초)", self.v_confirm, "확인 창이 뜬 뒤 '확인'을 누르기까지 (기본 0.4)", 8),
         ]
         for i, (lab, var, hint, w) in enumerate(items):
             ttk.Label(f, text=lab).grid(row=i, column=0, sticky="w", pady=4)
             ttk.Entry(f, textvariable=var, width=w).grid(row=i, column=1, sticky="w", pady=4, padx=8)
             ttk.Label(f, text=hint, style="Muted.TLabel").grid(row=i, column=2, sticky="w")
-        ttk.Label(f, text="점프 버튼 이름\n(한 줄에 하나, 순서대로 클릭)").grid(row=5, column=0, sticky="nw", pady=4)
+        n = len(items)
+        ttk.Label(f, text="실제 사이트에서 '너무 빠름'·확인 불가 실패가 나면 클릭 간격·확인 승인 지연을 "
+                          "0.5초씩 늘려 보세요(0~10초). 늘리면 점프 시간도 늘어납니다.",
+                  style="Muted.TLabel").grid(row=n, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(f, text="점프 버튼 이름\n(한 줄에 하나, 순서대로 클릭)").grid(row=n + 1, column=0, sticky="nw", pady=4)
         self.t_labels = tk.Text(f, width=30, height=5, bg=PANEL, fg=FG, insertbackground=FG, relief="flat")
         self.t_labels.insert("1.0", "\n".join(s.jump_labels))
-        self.t_labels.grid(row=5, column=1, columnspan=2, sticky="w", pady=4, padx=8)
+        self.t_labels.grid(row=n + 1, column=1, columnspan=2, sticky="w", pady=4, padx=8)
         b = ttk.Frame(f)
-        b.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        b.grid(row=n + 2, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(b, text="취소", command=self.destroy).pack(side="right", padx=4)
         ttk.Button(b, text="저장", style="Accent.TButton", command=self._ok).pack(side="right")
         self.grab_set()
@@ -172,6 +181,16 @@ class AdvancedDialog(tk.Toplevel):
             if not (math.isfinite(v) and lo <= v <= hi):
                 messagebox.showerror("입력 오류", f"{name}(초)은 {lo}~{hi} 사이여야 합니다.", parent=self)
                 return
+        try:
+            pace = [float(v.get()) for v in (self.v_gap, self.v_confirm)]
+        except ValueError:
+            messagebox.showerror("입력 오류", "클릭 간격·확인 승인 지연은 숫자여야 합니다.", parent=self)
+            return
+        lo, hi = PACE_RANGE
+        for v, name in zip(pace, ("클릭 간격", "확인 승인 지연")):
+            if not (math.isfinite(v) and lo <= v <= hi):
+                messagebox.showerror("입력 오류", f"{name}(초)은 {lo}~{hi} 사이여야 합니다.", parent=self)
+                return
         labels = [x.strip() for x in self.t_labels.get("1.0", "end").splitlines() if x.strip()]
         if not labels:
             messagebox.showerror("입력 오류", "점프 버튼 이름을 하나 이상 입력하세요.", parent=self)
@@ -182,9 +201,14 @@ class AdvancedDialog(tk.Toplevel):
             return
         self.s.chrome_path = chrome
         self.s.step_timeout_sec, self.s.dialog_timeout_sec, self.s.cycle_timeout_sec, self.s.verify_timeout_sec = vals
+        self.s.click_gap_sec, self.s.confirm_delay_sec = pace
         self.s.jump_labels = labels
         self.ok = True
         self.destroy()
+
+
+SCHEDULE_HINT = ("프로그램을 켜 둔 채 '전체 시작'을 한 번 누르면 매일 반복합니다. 종료 시각이 지나면 '대기'로 쉬다가 "
+                 "다음 날 시작 시각에 자동 재개합니다(전체 중지 아님). '전체 중지'를 누르거나 프로그램을 닫으면 멈춥니다.")
 
 
 class App:
@@ -281,6 +305,7 @@ class App:
         ttk.Button(cfg, text="고급 설정", command=self._advanced).pack(side="left")
         self.l_url = ttk.Label(r, text=self._url_hint(), style="Muted.TLabel", padding=(16, 0))
         self.l_url.pack(fill="x")
+        ttk.Label(r, text=SCHEDULE_HINT, style="Muted.TLabel", padding=(16, 2, 16, 0)).pack(fill="x")
 
         pw = ttk.PanedWindow(r, orient="vertical")
         pw.pack(fill="both", expand=True, padx=16, pady=8)
